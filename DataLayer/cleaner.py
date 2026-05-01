@@ -1,9 +1,12 @@
 from pathlib import Path
+import re
 import shutil
 import pandas as pd
 
 
 class DataCleaner:
+    AD_GROUP_PREFIX_PATTERN = re.compile(r"^[A-Za-z]\.")
+
     def __init__(self, processed_path: str = "data/processed/clean_users.parquet"):
         self.processed_path = Path(processed_path)
         self.processed_path.parent.mkdir(parents=True, exist_ok=True)
@@ -22,6 +25,7 @@ class DataCleaner:
                 if g
                 and not g.startswith("Cannot find an object")
                 and "Cannot find an object with identity" not in g
+                and not self.AD_GROUP_PREFIX_PATTERN.match(g)
             ]
 
             return cleaned
