@@ -13,7 +13,7 @@ def main():
 
     # initialize
     loader = DataLoader(BASE_PATH)
-    cleaner = DataCleaner("data/processed/clean_users.parquet")
+    cleaner = DataCleaner("../data/processed/clean_users.parquet")
 
     # debug path
     full_path = Path(BASE_PATH) / FILE_NAME
