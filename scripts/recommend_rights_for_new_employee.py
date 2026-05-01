@@ -95,9 +95,9 @@ def main():
     ad_df = load_ad_rights(AD_RIGHTS_PATH)
 
     new_employee = {
-        "DisplayName": "Jane Doe",
-        "Title": "Academic Outreach & Sales Rep",
-        "Department": "CE Academic Outreach & Sales",
+        "DisplayName": "Derek2",
+        "Title": "Computing Specialist",
+        "Department": "CE IT Helpdesk",
     }
 
     similar_users, recommendations = recommend_for_new_employee(
