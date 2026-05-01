@@ -5,6 +5,15 @@ from DataLayer.loader import DataLoader
 
 
 class RightsSheetsLoader:
+    EXCLUDED_ACCESS_CATEGORIES = {
+        "area",
+        "extras",
+        "ring central",
+        "cvent",
+        "orion",
+        "orion test",
+        "adobe",
+    }
 
     def __init__(self, raw_path: str):
         self.loader = DataLoader(base_path=raw_path)
@@ -41,11 +50,19 @@ class RightsSheetsLoader:
                 supervisor_col = col
                 break
 
+        name_col = None
+        for col in df.columns:
+            col_lower = col.lower()
+            if "name" in col_lower and "access" not in col_lower:
+                name_col = col
+                break
+
         access_category_cols = [
             col for col in df.columns
             if col not in [role_col, department_col, supervisor_col]
             and "employee" not in col.lower()
             and "name" not in col.lower()
+            and self._should_include_category(col)
         ]
 
         rows = []
@@ -54,6 +71,7 @@ class RightsSheetsLoader:
             job_title = row.get(role_col)
             department = row.get(department_col) if department_col else None
             supervisor = row.get(supervisor_col) if supervisor_col else None
+            employee_name = row.get(name_col) if name_col else None
 
             if pd.isna(job_title):
                 continue
@@ -73,13 +91,36 @@ class RightsSheetsLoader:
                             "JobTitle": str(job_title).strip(),
                             "Department": str(department).strip() if pd.notna(department) else None,
                             "Supervisor": str(supervisor).strip() if pd.notna(supervisor) else None,
+                            "ReferenceEmployeeName": (
+                                str(employee_name).strip() if pd.notna(employee_name) else None
+                            ),
                             "AccessCategory": category,
                             "AccessName": access_name,
+                            "AccessNameClean": access_name.lower().strip(),
                             "SourceFile": file_name,
                         }
                     )
 
         return pd.DataFrame(rows)
+
+    @classmethod
+    def _normalize_category(cls, value: str) -> str:
+        return " ".join(str(value).lower().split())
+
+    @classmethod
+    def _should_include_category(cls, category: str) -> bool:
+        normalized = cls._normalize_category(category)
+
+        if normalized in cls.EXCLUDED_ACCESS_CATEGORIES:
+            return False
+
+        if normalized.startswith("fsy orion"):
+            return False
+
+        if normalized.startswith("teamwork"):
+            return False
+
+        return True
 
     def _split_access_items(self, value) -> list[str]:
         text = str(value).strip()
@@ -87,8 +128,10 @@ class RightsSheetsLoader:
         if not text:
             return []
 
-        # Many cells have multiple access values separated by new lines
-        parts = text.replace(";", "\n").split("\n")
+        # normalize separators
+        text = text.replace(";", "\n")
+
+        parts = text.split("\n")
 
         cleaned = []
 
@@ -98,8 +141,10 @@ class RightsSheetsLoader:
             if not item:
                 continue
 
+            # remove junk
             if item.lower() in ["x", "n/a", "na", "none"]:
                 continue
+
 
             cleaned.append(item)
 
