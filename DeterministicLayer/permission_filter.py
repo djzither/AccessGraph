@@ -29,6 +29,15 @@ class PermissionFilter:
         group_lower = str(group_name).lower()
         return any(keyword in group_lower for keyword in self.ignore_keywords)
 
+    def is_door_access(self, row) -> bool:
+        group_lower = str(row.get("GroupName", "")).lower()
+        categories_lower = str(row.get("ReferenceCategories", "")).lower()
+
+        if "hceb doors" in categories_lower:
+            return True
+
+        return group_lower.startswith("hceb ") or group_lower.startswith("hcen ")
+
     def filter_recommendations(self, recommendations: pd.DataFrame) -> pd.DataFrame:
         recommendations = recommendations.copy()
 
@@ -40,6 +49,10 @@ class PermissionFilter:
         # Remove junk groups
         recommendations = recommendations[
             ~recommendations["GroupName"].apply(self.should_ignore)
+        ].copy()
+
+        recommendations = recommendations[
+            ~recommendations.apply(self.is_door_access, axis=1)
         ].copy()
 
         # Risk level
