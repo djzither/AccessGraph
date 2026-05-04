@@ -1,57 +1,93 @@
 AccessGraph
-AccessGraph is a hybrid access recommendation engine that analyzes user permissions and suggests appropriate access for new or existing employees. It combines deterministic role-based rules with machine learning to improve consistency and reduce over-permissioning.
+
+AccessGraph is a hybrid access recommendation engine designed to automate and improve role-based access provisioning. It analyzes historical user permissions and organizational patterns to recommend appropriate access for new or existing employees.
+
 Overview
-Managing access across systems such as Active Directory, ServiceNow, and internal tools is often manual and inconsistent. AccessGraph helps automate this process by:
-Learning access patterns from existing users
-Recommending permissions based on role and department
-Identifying unusual or high-risk access
-Supporting onboarding and access audits
-Architecture
-AccessGraph is built as a multi-layer pipeline:
-Data Layer
-Loads and cleans raw access data (e.g., AD exports)
-Converts group strings into structured lists
-Outputs a processed dataset for downstream use
-Deterministic Layer
-Builds access patterns using Title and Department
-Computes confidence scores for each permission
-Classifies access patterns (Baseline, Common, Rare, Unique)
-Machine Learning Layer
-Constructs a user-permission matrix
-Uses cosine similarity to identify similar users
-Generates recommendations based on nearest neighbors
-Product (Hybrid) Layer
-Combines deterministic and ML outputs
-Produces final decisions:
-Auto Approve
-Manual Review
-Low Confidence
-Flags sensitive or risky permissions
+
+Provisioning access across systems is often manual, inconsistent, and error-prone. AccessGraph addresses this by combining:
+
+Deterministic rules based on role and department
+Machine learning similarity between users
+Reference access sheets for validation
+Risk-aware filtering for sensitive permissions
+
+The result is a structured, explainable recommendation system for access control.
+
 Features
-Hybrid recommendation system (rules + ML)
-Role-based access pattern detection
-Supervisor and outlier handling
-Integration with reference access sheets
-Extensible design for API integration and automation
-Tech Stack
-Python (Pandas, scikit-learn)
-Cosine similarity for user matching
-Parquet for efficient data storage
-Usage
-Place raw data in:
+Role-Based Recommendations
+Suggests permissions using patterns from users with the same title and department.
+ML Similarity Engine
+Uses cosine similarity on user-permission matrices to find comparable users.
+Hybrid Decision Layer
+Combines rule-based and ML outputs into a final recommendation with confidence scores.
+Risk Filtering
+Flags sensitive or high-risk permissions for manual review.
+Access Pattern Analysis
+Classifies permissions as baseline, common, rare, or unique.
+Reference Sheet Matching
+Aligns recommendations with official access documentation when available.
+Data Pipeline
+Ingestion
+Loads raw Active Directory exports (CSV/XLSX)
+Cleaning
+Parses group memberships
+Removes invalid or missing entries
+Outputs structured data (GroupsList)
+Processing
+Builds role-based permission matrices
+Computes confidence scores per permission
+Recommendation Engine
+Deterministic rules (role + department)
+ML similarity (nearest users)
+Hybrid merge with final scoring
+Project Structure
+AccessGraph/
+│
+├── data/
+│   ├── raw/              # Raw AD exports (ignored by git)
+│   ├── processed/        # Cleaned parquet data
+│
+├── DataLayer/
+│   └── cleaner.py        # Data cleaning logic
+│
+├── ModelLayer/
+│   └── similarity_model.py
+│
+├── ProductLayer/
+│   ├── rules_recommender.py
+│   ├── ml_recommender.py
+│   ├── hybrid_recommender.py
+│
+├── scripts/
+│   ├── run_real_pipeline.py
+│   ├── run_combined_pipeline.py
+│
+└── README.md
+Example Output
+
+Each recommendation includes:
+
+GroupName
+FinalScore
+FinalDecision (Auto Approve / Manual Review / Low Confidence)
+Confidence (rule-based or ML-based)
+Supporting evidence (similar users, counts)
+Use Cases
+New employee onboarding
+Access auditing and cleanup
+Identifying over-permissioned users
+Standardizing access across teams
+Future Improvements
+Integration with ServiceNow APIs
+Real-time provisioning workflows
+LLM-assisted decision explanations
+Feedback loop for continuous learning
+Setup
+Install dependencies
+pip install -r requirements.txt
+Place raw AD export in:
 data/raw/
-Run data cleaning:
+Run pipeline:
 python scripts/run_real_pipeline.py
 Generate recommendations:
 python scripts/run_combined_pipeline.py
-Example Use Case
-Given a new hire with a known role and department, AccessGraph:
-Identifies similar users
-Extracts common permissions
-Filters out risky or irrelevant access
-Outputs a ranked list of recommended permissions
-Future Work
-Integration with ServiceNow and Active Directory APIs
-Automated provisioning workflows
-Feedback loop for improving recommendations
-LLM-assisted reasoning for ambiguous cases
