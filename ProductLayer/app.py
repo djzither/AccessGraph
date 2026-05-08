@@ -322,6 +322,7 @@ def render_orphaned_access_tab(users_df: pd.DataFrame) -> None:
         scope_label = st.radio(
             "Comparison scope",
             ["Department", "Role (Title + Department)"],
+            index=1,
             horizontal=True,
             key="oa_scope",
         )
@@ -330,7 +331,7 @@ def render_orphaned_access_tab(users_df: pd.DataFrame) -> None:
             "Minimum cohort size (skip tiny teams)",
             min_value=2,
             max_value=20,
-            value=3,
+            value=5,
             key="oa_minpeers",
         )
     with ctrl3:
@@ -351,8 +352,24 @@ def render_orphaned_access_tab(users_df: pd.DataFrame) -> None:
             min_peer_count=min_peers,
         )
 
+    group_keys = ["Department"] if scope_key == "department" else ["Title", "Department"]
+    cohort_sizes = users_df.groupby(group_keys).size()
+    small_cohort_count = int((cohort_sizes < min_peers).sum())
+    analyzed_cohort_count = int((cohort_sizes >= min_peers).sum())
+
     if result.empty:
-        st.success("No unique or orphaned access patterns detected with these settings.")
+        if analyzed_cohort_count == 0:
+            st.warning(
+                f"No cohorts met the minimum size of {min_peers}. "
+                "Result is inconclusive due to insufficient cohort data."
+            )
+        else:
+            st.success("No unique or orphaned access patterns detected with these settings.")
+        if small_cohort_count > 0:
+            st.caption(
+                f"Skipped {small_cohort_count} cohort(s) below minimum size "
+                f"({min_peers}); analyzed {analyzed_cohort_count} cohort(s)."
+            )
         return
 
     unique_total = int(result["UniqueGroupCount"].sum())
@@ -362,6 +379,11 @@ def render_orphaned_access_tab(users_df: pd.DataFrame) -> None:
     ma.metric("Users Flagged", len(result))
     mb.metric("Total Unique Groups", unique_total)
     mc.metric("Total Rare Groups", rare_total)
+    if small_cohort_count > 0:
+        st.caption(
+            f"Skipped {small_cohort_count} cohort(s) below minimum size "
+            f"({min_peers}); analyzed {analyzed_cohort_count} cohort(s)."
+        )
 
     st.divider()
     st.markdown("#### Flagged Users")
