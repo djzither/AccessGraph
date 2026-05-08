@@ -59,6 +59,8 @@ class AccessPatternAnalyzer:
             if cohort_size < min_peer_count:
                 continue
 
+            cohort_member_ids = sorted(cohort["SamAccountName"].astype(str).tolist())
+
             # Count how many cohort members hold each group
             group_counts: dict[str, int] = {}
             for groups in cohort["GroupsList"]:
@@ -80,15 +82,19 @@ class AccessPatternAnalyzer:
                 if not unique_groups and not rare_groups:
                     continue
 
+                this_user = str(user_row.get("SamAccountName", ""))
                 rows.append({
-                    "SamAccountName":  str(user_row.get("SamAccountName", "")),
-                    "Title":           str(user_row.get("Title", "")),
-                    "Department":      str(user_row.get("Department", "")),
-                    "CohortSize":      cohort_size,
+                    "SamAccountName":   this_user,
+                    "Title":            str(user_row.get("Title", "")),
+                    "Department":       str(user_row.get("Department", "")),
+                    "CohortSize":       cohort_size,
                     "UniqueGroupCount": len(unique_groups),
                     "RareGroupCount":   len(rare_groups),
-                    "UniqueGroups":    ", ".join(sorted(unique_groups)),
-                    "RareGroups":      ", ".join(sorted(rare_groups)),
+                    "UniqueGroups":     ", ".join(sorted(unique_groups)),
+                    "RareGroups":       ", ".join(sorted(rare_groups)),
+                    "CohortMembers":    ", ".join(
+                        m for m in cohort_member_ids if m != this_user
+                    ),
                 })
 
         if not rows:

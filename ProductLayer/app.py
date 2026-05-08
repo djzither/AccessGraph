@@ -382,6 +382,17 @@ def render_orphaned_access_tab(users_df: pd.DataFrame) -> None:
                 else:
                     st.caption("None.")
 
+            st.markdown("**Cohort peers:**")
+            peers = [
+                p.strip()
+                for p in str(user_row.get("CohortMembers", "")).split(",")
+                if p.strip()
+            ]
+            if peers:
+                st.caption("  ·  ".join(peers))
+            else:
+                st.caption("No peers recorded.")
+
 
 # ---------------------------------------------------------------------------
 # App entry point
