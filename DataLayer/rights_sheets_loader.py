@@ -1,4 +1,5 @@
 from pathlib import Path
+import re
 import pandas as pd
 
 from DataLayer.loader import DataLoader
@@ -144,8 +145,26 @@ class RightsSheetsLoader:
             # remove junk
             if item.lower() in ["x", "n/a", "na", "none"]:
                 continue
+            if self._is_likely_person_entry(item):
+                continue
 
 
             cleaned.append(item)
 
         return cleaned
+
+    @classmethod
+    def _is_likely_person_entry(cls, item: str) -> bool:
+        value = str(item).strip().strip(",")
+        lower = value.lower()
+
+        # Drop "first last" and similar personal name rows.
+        if re.fullmatch(r"[a-z]+(?:[ '-][a-z]+)+", lower):
+            return True
+
+        # Drop user-id style single tokens (no spaces), while keeping group-like
+        # values that contain separators such as dot/underscore/backslash.
+        if " " not in lower and re.fullmatch(r"[a-z]{5,}\d{0,4}", lower):
+            return True
+
+        return False

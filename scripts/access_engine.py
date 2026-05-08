@@ -4,6 +4,7 @@ import pandas as pd
 from DataLayer.cleaner import DataCleaner
 from DataLayer.loader import DataLoader
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
+from DeterministicLayer.title_embed_matcher import TitleEmbedMatcher
 from ProductLayer.AccessRecommendationEngine import AccessRecommendationEngine
 
 
@@ -42,13 +43,26 @@ def main():
     print(f"Loaded reference access rows: {len(reference_df)}")
     print("Reference columns:", list(reference_df.columns))
 
-    engine = AccessRecommendationEngine(min_confidence=0.4)
+    try:
+        title_matcher = TitleEmbedMatcher(
+            model_name="intfloat/e5-small-v2",
+            threshold=0.78,
+        )
+        print("Loaded title embedding matcher: intfloat/e5-small-v2")
+    except Exception as exc:
+        title_matcher = None
+        print(f"Could not load title embedding matcher. Continuing without it. ({exc})")
 
-    title = "Computing Specialist"
-    department = "CE IT Help Desk"
+    engine = AccessRecommendationEngine(
+        min_confidence=0.4,
+        title_matcher=title_matcher,
+    )
+
+    title = "Customer Service Rep"
+    department = "CE Customer Support"
     employee_type = "Student"
     supervisor = None
-    copy_from_netid = "ag877"
+    copy_from_netid = "btang5"
 
     recommendations = engine.recommend_for_hire(
         users_df=users_df,

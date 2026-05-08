@@ -1,8 +1,10 @@
 import pandas as pd
 from collections import Counter
+import re
 
 from DeterministicLayer.permission_filter import PermissionFilter
 from DeterministicLayer.permission_matrix import PermissionMatrixBuilder
+from DeterministicLayer.title_embed_matcher import TitleEmbedMatcher
 from MLLayer.recommender import MLRecommender
 
 
@@ -28,9 +30,14 @@ class AccessRecommendationEngine:
         },
     }
 
-    def __init__(self, min_confidence: float = 0.5):
+    def __init__(
+        self,
+        min_confidence: float = 0.5,
+        title_matcher: TitleEmbedMatcher | None = None,
+    ):
         self.matrix_builder = PermissionMatrixBuilder(min_confidence=min_confidence)
         self.permission_filter = PermissionFilter()
+        self.title_matcher = title_matcher
 
     def recommend_for_hire(
         self,
@@ -59,6 +66,8 @@ class AccessRecommendationEngine:
             title=title,
             department=department,
             reference_recs=reference_recs,
+            employee_type=employee_type,
+            copy_from_netid=copy_from_netid,
         )
 
         ad_recs = self._get_ad_recommendations(
@@ -83,6 +92,8 @@ class AccessRecommendationEngine:
             ml_recs=ml_recs,
             copy_from_recs=copy_from_recs,
         )
+        merged["EmployeeTypeClean"] = str(employee_type).lower().strip()
+        merged["IsFSYRole"] = self._is_fsy_role(title=title, department=department)
 
         merged = self.permission_filter.filter_recommendations(merged)
 
@@ -130,6 +141,24 @@ class AccessRecommendationEngine:
             )
             & (ref["EmployeeTypeClean"] == employee_type_clean)
         ].copy()
+
+        if matched.empty:
+            employee_ref = ref[ref["EmployeeTypeClean"] == employee_type_clean].copy()
+            if not employee_ref.empty:
+                candidate_titles = employee_ref["JobTitle"].dropna().astype(str).unique().tolist()
+                embed_matcher = self.title_matcher
+                if embed_matcher is None:
+                    try:
+                        embed_matcher = TitleEmbedMatcher()
+                    except Exception:
+                        embed_matcher = None
+
+                if embed_matcher is not None:
+                    best_title, _ = embed_matcher.best_match(title, candidate_titles)
+                    if best_title is not None:
+                        matched = employee_ref[
+                            employee_ref["JobTitle"].astype(str) == best_title
+                        ].copy()
 
         if employee_type_clean == "full time" and supervisor is not None:
             supervisor_clean = str(supervisor).lower().strip()
@@ -399,28 +428,47 @@ class AccessRecommendationEngine:
 
     def _score_row(self, row) -> float:
         score = 0
+        employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
+        is_fsy_role = bool(row.get("IsFSYRole", False))
+
+        if is_fsy_role:
+            reference_weight = 0.65
+            ad_weights = (0.20, 0.15, 0.10)
+            ml_weights = (0.10, 0.05, 0.03)
+            copy_weight = 0.05
+        elif employee_type_clean == "full time":
+            reference_weight = 0.30
+            ad_weights = (0.30, 0.20, 0.10)
+            ml_weights = (0.25, 0.20, 0.10)
+            copy_weight = 0.20
+        else:
+            # Students: trust the reference access list more.
+            reference_weight = 0.60
+            ad_weights = (0.20, 0.10, 0.05)
+            ml_weights = (0.10, 0.05, 0.03)
+            copy_weight = 0.05
 
         if row["InReferenceSheet"]:
-            score += 0.45
+            score += reference_weight
 
         if row["ADConfidence"] >= 0.8:
-            score += 0.30
+            score += ad_weights[0]
         elif row["ADConfidence"] >= 0.6:
-            score += 0.20
+            score += ad_weights[1]
         elif row["ADConfidence"] >= 0.4:
-            score += 0.10
+            score += ad_weights[2]
 
         if row["MLConfidence"] >= 0.8:
-            score += 0.15
+            score += ml_weights[0]
         elif row["MLConfidence"] >= 0.6:
-            score += 0.10
+            score += ml_weights[1]
         elif row["MLConfidence"] >= 0.4:
-            score += 0.05
+            score += ml_weights[2]
 
         if row["CopyFromUserHasIt"]:
-            score += 0.10
+            score += copy_weight
 
-        return round(score, 3)
+        return round(min(score, 1.0), 3)
 
     def _final_decision(self, row) -> str:
         if row["RiskLevel"] == "High":
@@ -482,6 +530,8 @@ class AccessRecommendationEngine:
         title: str,
         department: str,
         reference_recs: pd.DataFrame,
+        employee_type: str,
+        copy_from_netid: str | None = None,
     ) -> pd.DataFrame:
         users = users_df.copy()
 
@@ -492,6 +542,20 @@ class AccessRecommendationEngine:
         department_clean = self._normalize_role_text(department)
 
         same_department = users[users["DepartmentClean"] == department_clean].copy()
+
+        if same_department.empty:
+            # Full-time requests can come from a reference sheet title/department
+            # that does not exactly match AD naming. If a copy-from user is given,
+            # use that user's AD department as the cohort anchor.
+            if str(employee_type).lower().strip() == "full time" and copy_from_netid is not None:
+                copy_user = users[users["SamAccountName"] == copy_from_netid]
+                if not copy_user.empty:
+                    copy_department_clean = copy_user.iloc[0]["DepartmentClean"]
+                    fallback_department = users[
+                        users["DepartmentClean"] == copy_department_clean
+                    ].copy()
+                    if not fallback_department.empty:
+                        same_department = fallback_department
 
         if same_department.empty:
             return users[
@@ -563,4 +627,11 @@ class AccessRecommendationEngine:
                 text = text[len(prefix):]
                 break
 
-        return " ".join(text.split())
+        text = re.sub(r"[\s._-]+", "", text)
+        return text
+
+    @classmethod
+    def _is_fsy_role(cls, title: str, department: str) -> bool:
+        title_clean = cls._normalize_role_text(title)
+        department_clean = cls._normalize_role_text(department)
+        return "fsy" in title_clean or "fsy" in department_clean
