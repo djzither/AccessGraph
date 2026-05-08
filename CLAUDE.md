@@ -30,3 +30,12 @@ Recommend access rights for new employees or access requests using:
 - Preserve modular structure.
 - Prefer working demo over perfect architecture.
 - Every recommendation should explain why.
+- 
+## Editing Rules
+
+- Never modify files automatically.
+- Always explain proposed changes first.
+- Show unified diffs before edits.
+- Wait for explicit approval before applying changes.
+- Prefer additive localized changes.
+- Do not rewrite unrelated files.
