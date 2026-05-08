@@ -16,6 +16,16 @@ class RightsSheetsLoader:
         "adobe",
     }
 
+    # Job titles to silently skip when loading reference sheets.
+    # Stored post-normalization: dots removed, lowercase, whitespace collapsed,
+    # and known spelling variants resolved before comparison.
+    EXCLUDED_JOB_TITLES = {
+        "ce fsy us counselor",
+        "ce fsy us coordinator",
+        "ce fsy us assistant coordinator",
+        "ce fsy us wellness coordinator",
+    }
+
     def __init__(self, raw_path: str):
         self.loader = DataLoader(base_path=raw_path)
 
@@ -77,6 +87,9 @@ class RightsSheetsLoader:
             if pd.isna(job_title):
                 continue
 
+            if self._normalize_title_for_exclusion(job_title) in self.EXCLUDED_JOB_TITLES:
+                continue
+
             for category in access_category_cols:
                 cell_value = row.get(category)
 
@@ -103,6 +116,16 @@ class RightsSheetsLoader:
                     )
 
         return pd.DataFrame(rows)
+
+    @classmethod
+    def _normalize_title_for_exclusion(cls, value: str) -> str:
+        text = str(value).strip().lower()
+        text = re.sub(r"\.", "", text)            # "U.S." → "us"
+        text = re.sub(r"\s+", " ", text).strip()  # collapse spaces
+        text = text.replace("councilor", "counselor")     # spelling variant
+        text = text.replace("coordiator", "coordinator")  # missing 'n' typo
+        text = text.replace("co-ordinator", "coordinator")
+        return text
 
     @classmethod
     def _normalize_category(cls, value: str) -> str:
