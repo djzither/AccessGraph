@@ -30,6 +30,13 @@ DECISION_BADGE: dict[str, tuple[str, str]] = {
     "Ignore":                ("⚪", "#f0f0f0"),
 }
 
+EXCLUDED_FSY_TITLES = {
+    "ce fsy us coordinator",
+    "ce fsy us assistant coordinator",
+    "ce fsy us wellness coordinator",
+    "ce fsy us counselor",
+}
+
 
 # ---------------------------------------------------------------------------
 # Data loaders (cached so they only run once per session)
@@ -75,6 +82,20 @@ def _fmt_pct(val: float) -> str:
     return f"{val:.0%}" if val > 0 else "—"
 
 
+def _normalize_title_for_exclusion(value: str) -> str:
+    text = str(value).strip().lower()
+    text = text.replace(".", "")
+    text = " ".join(text.split())
+    text = text.replace("councilor", "counselor")
+    return text
+
+
+def _filter_excluded_fsy_roles(users_df: pd.DataFrame) -> pd.DataFrame:
+    filtered = users_df.copy()
+    title_norm = filtered["Title"].astype(str).apply(_normalize_title_for_exclusion)
+    return filtered[~title_norm.isin(EXCLUDED_FSY_TITLES)].copy()
+
+
 # ---------------------------------------------------------------------------
 # Tab 1 — New Hire Onboarding
 # ---------------------------------------------------------------------------
@@ -86,11 +107,13 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
         "ML cosine similarity, and copy-from user."
     )
 
-    titles = sorted(users_df["Title"].dropna().astype(str).unique())
-    departments = sorted(users_df["Department"].dropna().astype(str).unique())
+    users_for_recs = _filter_excluded_fsy_roles(users_df)
+
+    titles = sorted(users_for_recs["Title"].dropna().astype(str).unique())
+    departments = sorted(users_for_recs["Department"].dropna().astype(str).unique())
     all_netids = [""] + sorted(
-        users_df["SamAccountName"].dropna().astype(str).unique()
-    ) if "SamAccountName" in users_df.columns else [""]
+        users_for_recs["SamAccountName"].dropna().astype(str).unique()
+    ) if "SamAccountName" in users_for_recs.columns else [""]
 
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
@@ -128,8 +151,8 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
 
     # Cohort preview before running
     cohort_size = len(
-        users_df[
-            (users_df["Title"] == title) & (users_df["Department"] == department)
+        users_for_recs[
+            (users_for_recs["Title"] == title) & (users_for_recs["Department"] == department)
         ]
     )
 
@@ -148,7 +171,7 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
     with st.spinner("Running hybrid recommendation engine…"):
         try:
             recs = engine.recommend_for_hire(
-                users_df=users_df,
+                users_df=users_for_recs,
                 reference_df=ref,
                 title=title,
                 department=department,
