@@ -341,53 +341,46 @@ def render_orphaned_access_tab(users_df: pd.DataFrame) -> None:
     mc.metric("Total Rare Groups", rare_total)
 
     st.divider()
-
-    # Summary table (without the long group-name strings)
     st.markdown("#### Flagged Users")
-    summary_cols = [
-        "SamAccountName", "Title", "Department",
-        "CohortSize", "UniqueGroupCount", "RareGroupCount",
-    ]
-    summary_cols = [c for c in summary_cols if c in result.columns]
-    st.dataframe(
-        result[summary_cols].rename(columns={
-            "SamAccountName":   "User",
-            "CohortSize":       "Cohort",
-            "UniqueGroupCount": "Unique",
-            "RareGroupCount":   "Rare",
-        }),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.divider()
-    st.markdown("#### Inspect a User")
-
-    users_with_flags = result["SamAccountName"].tolist()
-    selected_user = st.selectbox("Select user to inspect", users_with_flags, key="oa_user")
-    user_row = result[result["SamAccountName"] == selected_user].iloc[0]
 
     def _split_groups(raw: str) -> list[str]:
         return [g.strip() for g in raw.split(",") if g.strip()] if raw else []
 
-    unique_list = _split_groups(user_row["UniqueGroups"])
-    rare_list = _split_groups(user_row["RareGroups"])
+    for _, user_row in result.iterrows():
+        unique_list = _split_groups(user_row["UniqueGroups"])
+        rare_list = _split_groups(user_row["RareGroups"])
 
-    ins1, ins2 = st.columns(2)
-    with ins1:
-        st.markdown(f"**🔴 Unique groups** — only this user in cohort of {user_row['CohortSize']}")
-        if unique_list:
-            for g in unique_list:
-                st.markdown(f"- `{g}`")
-        else:
-            st.caption("None.")
-    with ins2:
-        st.markdown(f"**🟡 Rare groups** — held by <10% of cohort ({user_row['CohortSize']} peers)")
-        if rare_list:
-            for g in rare_list:
-                st.markdown(f"- `{g}`")
-        else:
-            st.caption("None.")
+        label = (
+            f"{user_row['SamAccountName']}  |  "
+            f"{user_row['Title']} — {user_row['Department']}  |  "
+            f"🔴 {int(user_row['UniqueGroupCount'])} unique   "
+            f"🟡 {int(user_row['RareGroupCount'])} rare"
+        )
+
+        with st.expander(label):
+            col1, col2 = st.columns(2)
+
+            with col1:
+                st.markdown(
+                    f"**🔴 Unique groups** — only this user "
+                    f"in cohort of {int(user_row['CohortSize'])}"
+                )
+                if unique_list:
+                    for g in unique_list:
+                        st.markdown(f"- `{g}`")
+                else:
+                    st.caption("None.")
+
+            with col2:
+                st.markdown(
+                    f"**🟡 Rare groups** — held by <10% "
+                    f"of cohort ({int(user_row['CohortSize'])} peers)"
+                )
+                if rare_list:
+                    for g in rare_list:
+                        st.markdown(f"- `{g}`")
+                else:
+                    st.caption("None.")
 
 
 # ---------------------------------------------------------------------------
