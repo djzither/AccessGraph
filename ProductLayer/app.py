@@ -186,10 +186,117 @@ def _render_cooccurrence_table(co_state, gname: str, co_top_n: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Onboarding UI — placeholders & demo ticket helpers
+# ---------------------------------------------------------------------------
+
+_OB_PH_TITLE = "Select job title…"
+_OB_PH_DEPT = "Select department…"
+_OB_PH_ET = "Select employee type…"
+_OB_PH_NET = "Select new hire NetID…"
+_OB_PH_COPY = "Select user to copy permissions from…"
+
+
+def _match_string_to_corpus(candidate: str, corpus: list[str]) -> str:
+    """Case-insensitive exact match, then loose substring containment."""
+    if not candidate or not corpus:
+        return ""
+    c_low = candidate.strip().lower()
+    for item in corpus:
+        if item.strip().lower() == c_low:
+            return item
+    for item in corpus:
+        il = item.lower()
+        if c_low in il or il in c_low:
+            return item
+    return ""
+
+
+def _map_ticket_employee_type_to_ui(raw: object) -> str:
+    """Map ticket ``Employee Type`` text to onboarding UI labels."""
+    if raw is None or (isinstance(raw, float) and pd.isna(raw)):
+        return ""
+    s = str(raw).strip().lower()
+    if not s:
+        return ""
+    if "student" in s:
+        return "Student"
+    if "full" in s or "staff" in s or "faculty" in s:
+        return "Full Time"
+    return ""
+
+
+def _apply_demo_ticket_row_to_session(
+    row: pd.Series,
+    *,
+    titles_list: list[str],
+    departments_list: list[str],
+    valid_netids: set[str],
+) -> list[str]:
+    """
+    Push parsed demo ticket fields into onboarding widget session keys.
+
+    Parquet comes from PDF ingestion today; a future ServiceNow Table API
+    pipeline should populate the same normalized columns before calling this.
+    """
+    warnings: list[str] = []
+
+    ejt = str(row.get("Employee Job Title") or "").strip()
+    matched_title = _match_string_to_corpus(ejt, titles_list)
+    ttl_full = str(row.get("Title") or "").replace("\n", " ").strip()
+    if not matched_title and ttl_full:
+        matched_title = _match_string_to_corpus(ttl_full, titles_list)
+        if not matched_title:
+            for part in ttl_full.split(" - "):
+                m = _match_string_to_corpus(part.strip(), titles_list)
+                if m:
+                    matched_title = m
+                    break
+    if ejt and not matched_title:
+        warnings.append(
+            f"Employee Job Title «{ejt}» did not match any dataset title — choose **Job Title** manually."
+        )
+    st.session_state["ob_title"] = matched_title or ""
+
+    # Optional columns from expanded pipelines / future API:
+    dept_raw = (
+        str(row.get("requester_department") or row.get("Requester Department") or "").strip()
+    )
+    matched_dept = _match_string_to_corpus(dept_raw, departments_list) if dept_raw else ""
+    if dept_raw and not matched_dept:
+        warnings.append(
+            f"Department «{dept_raw}» did not match — choose **Department** manually."
+        )
+    st.session_state["ob_dept"] = matched_dept or ""
+
+    et_ui = _map_ticket_employee_type_to_ui(row.get("Employee Type"))
+    st.session_state["ob_emptype"] = et_ui or ""
+
+    sup = str(row.get("Supervisor") or "").strip()
+    st.session_state["ob_supervisor"] = sup
+
+    sam = str(row.get("DemoSamAccountName") or "").strip()
+    if sam and sam in valid_netids:
+        st.session_state["ob_newhire"] = sam
+    else:
+        if sam:
+            warnings.append(
+                f"Demo NetID «{sam}» is not in the loaded user corpus — choose **New hire NetID** manually."
+            )
+        st.session_state["ob_newhire"] = ""
+
+    st.session_state["ob_copyfrom"] = ""
+    return warnings
+
+
+# ---------------------------------------------------------------------------
 # Tab 1 — New Hire Onboarding
 # ---------------------------------------------------------------------------
 
-def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) -> None:
+def render_onboarding_tab(
+    users_df: pd.DataFrame,
+    reference_df: pd.DataFrame,
+    demo_tickets_df: pd.DataFrame | None = None,
+) -> None:
     st.subheader("New Hire Access Recommendations")
     st.caption(
         "The engine merges four signals: reference sheet, AD peer frequency, "
@@ -200,34 +307,145 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
 
     titles = sorted(users_for_recs["Title"].dropna().astype(str).unique())
     departments = sorted(users_for_recs["Department"].dropna().astype(str).unique())
-    all_netids = [""] + sorted(
-        users_for_recs["SamAccountName"].dropna().astype(str).unique()
-    ) if "SamAccountName" in users_for_recs.columns else [""]
+    netid_values = sorted(users_for_recs["SamAccountName"].dropna().astype(str).unique())
+    valid_netids = set(netid_values)
+    all_netids_opts = [""] + netid_values if netid_values else [""]
+
+    title_opts = [""] + titles
+    dept_opts = [""] + departments
+    emptype_opts = ["", "Full Time", "Student"]
+
+    # ── Demo ticket source (parquet from PDF parser — not live ServiceNow API)
+    if demo_tickets_df is not None and not demo_tickets_df.empty:
+        with st.container():
+            st.markdown("##### Parsed demo ServiceNow ticket")
+            st.caption(
+                "Optional: apply fields from ``demo_servicenow_tickets.parquet`` "
+                "(built from exported PDFs). A future live loader can feed the same UI."
+            )
+            use_ticket_src = st.checkbox(
+                "Use parsed demo ServiceNow ticket",
+                value=False,
+                key="ob_use_demo_ticket_source",
+            )
+            if use_ticket_src:
+                nums = sorted(
+                    demo_tickets_df["Number"].dropna().astype(str).unique().tolist()
+                )
+                ticket_opt_vals = [""] + nums
+
+                def _fmt_ticket_choice(num: str) -> str:
+                    if num == "":
+                        return "Select a ticket…"
+                    match = demo_tickets_df[demo_tickets_df["Number"].astype(str) == num]
+                    if match.empty:
+                        return num
+                    r0 = match.iloc[0]
+                    ttl = str(r0.get("Title", "")).replace("\n", " ").strip()
+                    if len(ttl) > 52:
+                        ttl = ttl[:52] + "…"
+                    tt = str(r0.get("Ticket Type", "") or "")
+                    return f"{num} — {ttl} — {tt}"
+
+                picked_num = st.selectbox(
+                    "Demo ticket",
+                    options=ticket_opt_vals,
+                    format_func=_fmt_ticket_choice,
+                    key="ob_demo_ticket_pick",
+                )
+
+                preview_row = None
+                if picked_num:
+                    pm = demo_tickets_df[
+                        demo_tickets_df["Number"].astype(str) == picked_num
+                    ]
+                    if not pm.empty:
+                        preview_row = pm.iloc[0]
+
+                if preview_row is not None:
+                    pr = preview_row
+                    st.markdown("**Ticket preview**")
+                    pv = st.columns(3)
+                    pv[0].markdown(
+                        f"**Number:** `{pr.get('Number', '')}`  \n"
+                        f"**Ticket Type:** {pr.get('Ticket Type', '')}"
+                    )
+                    pv[1].markdown(
+                        f"**Employee Job Title:** {pr.get('Employee Job Title', '')}  \n"
+                        f"**DemoDisplayName:** {pr.get('DemoDisplayName', '')}"
+                    )
+                    pv[2].markdown(
+                        f"**MatchConfidence:** {pr.get('MatchConfidence', '')}  \n"
+                        f"**Internal Notes keywords:** `{pr.get('_demo_internal_notes_keywords', '')}`"
+                    )
+                    st.markdown(
+                        "**Title:** "
+                        + str(pr.get("Title", "")).replace("\n", " ")
+                    )
+                    if st.button(
+                        "Use this ticket for recommendation",
+                        type="primary",
+                        key="ob_apply_demo_ticket",
+                    ):
+                        warn = _apply_demo_ticket_row_to_session(
+                            preview_row,
+                            titles_list=titles,
+                            departments_list=departments,
+                            valid_netids=valid_netids,
+                        )
+                        for w in warn:
+                            st.warning(w)
+                        st.success(
+                            "Ticket values applied to the form below. "
+                            "Confirm **Job Title**, **Department**, and **Employee Type**, "
+                            "then run **Generate Recommendations**."
+                        )
+
+            st.divider()
 
     col1, col2, col3 = st.columns([2, 2, 1])
     with col1:
-        title = st.selectbox("Job Title", titles, key="ob_title")
+        title = st.selectbox(
+            "Job Title",
+            options=title_opts,
+            key="ob_title",
+            format_func=lambda x: _OB_PH_TITLE if x == "" else x,
+        )
     with col2:
-        department = st.selectbox("Department", departments, key="ob_dept")
+        department = st.selectbox(
+            "Department",
+            options=dept_opts,
+            key="ob_dept",
+            format_func=lambda x: _OB_PH_DEPT if x == "" else x,
+        )
     with col3:
         employee_type = st.selectbox(
-            "Employee Type", ["Full Time", "Student"], key="ob_emptype"
+            "Employee Type",
+            options=emptype_opts,
+            key="ob_emptype",
+            format_func=lambda x: _OB_PH_ET if x == "" else x,
         )
 
     with st.expander("Advanced options (supervisor / copy-from / confidence)"):
         adv1, adv2 = st.columns(2)
         with adv1:
-            supervisor = st.text_input("Supervisor name (optional)", key="ob_supervisor")
+            supervisor = st.text_input(
+                "Supervisor name (optional)",
+                key="ob_supervisor",
+                placeholder="Select or type supervisor…",
+            )
             copy_from = st.selectbox(
                 "Copy permissions from existing user (optional)",
-                all_netids,
+                options=all_netids_opts,
                 key="ob_copyfrom",
+                format_func=lambda x: _OB_PH_COPY if x == "" else x,
             )
         with adv2:
             new_hire_netid = st.selectbox(
                 "New hire NetID — if already in AD, enables ML similarity",
-                all_netids,
+                options=all_netids_opts,
                 key="ob_newhire",
+                format_func=lambda x: _OB_PH_NET if x == "" else x,
             )
             min_confidence = st.slider(
                 "Minimum AD confidence",
@@ -269,19 +487,41 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
                 key="ob_co_rows",
             )
 
-    # Cohort preview before running
-    cohort_size = len(
-        users_for_recs[
-            (users_for_recs["Title"] == title) & (users_for_recs["Department"] == department)
-        ]
-    )
+    # Cohort preview before running (requires explicit title + department)
+    if title and department:
+        cohort_size = len(
+            users_for_recs[
+                (users_for_recs["Title"] == title)
+                & (users_for_recs["Department"] == department)
+            ]
+        )
+        cohort_msg = str(cohort_size)
+    else:
+        cohort_msg = "—"
 
     run = st.button("Generate Recommendations", type="primary", key="ob_run")
 
     if not run:
         st.info(
-            f"**{cohort_size}** existing users match this title + department. "
-            "Click **Generate Recommendations** to run the hybrid engine."
+            f"**{cohort_msg}** existing users match this title + department "
+            "(when both are selected). "
+            "Choose **Job Title**, **Department**, and **Employee Type**, then click "
+            "**Generate Recommendations**."
+        )
+        return
+
+    missing_required: list[str] = []
+    if not title:
+        missing_required.append("Job Title")
+    if not department:
+        missing_required.append("Department")
+    if not employee_type:
+        missing_required.append("Employee Type")
+    if missing_required:
+        st.warning(
+            "Please select all required fields before generating recommendations: "
+            + ", ".join(f"**{m}**" for m in missing_required)
+            + "."
         )
         return
 
@@ -969,6 +1209,20 @@ def main() -> None:
             f"✅ Reference sheet: {len(reference_df):,} access entries loaded."
         )
 
+    # Parsed demo tickets (PDF → parquet). Optional for onboarding; not live ServiceNow API.
+    demo_tickets_df: pd.DataFrame | None = None
+    if DEMO_SERVICE_NOW_TICKETS_PATH.is_file():
+        try:
+            _dt_mtime = DEMO_SERVICE_NOW_TICKETS_PATH.stat().st_mtime
+            _dt_load = load_demo_servicenow_tickets(
+                str(DEMO_SERVICE_NOW_TICKETS_PATH.resolve()),
+                _dt_mtime,
+            )
+            if not _dt_load.empty:
+                demo_tickets_df = _dt_load
+        except Exception:
+            demo_tickets_df = None
+
     # Tabs
     tab1, tab2, tab3, tab4 = st.tabs([
         "🧑‍💼 New Hire Onboarding",
@@ -978,7 +1232,7 @@ def main() -> None:
     ])
 
     with tab1:
-        render_onboarding_tab(users_df, reference_df)
+        render_onboarding_tab(users_df, reference_df, demo_tickets_df)
 
     with tab2:
         render_privilege_audit_tab(users_df)
