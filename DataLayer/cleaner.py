@@ -35,6 +35,12 @@ class DataCleaner:
 
         return df
 
+    @staticmethod
+    def validate_required_columns(df: pd.DataFrame, required: set[str]) -> None:
+        missing = required - set(df.columns)
+        if missing:
+            raise ValueError(f"Missing required columns: {sorted(missing)}")
+
     def save_cleaned(self, df: pd.DataFrame) -> None:
         if self.processed_path.exists():
             if self.processed_path.is_dir():

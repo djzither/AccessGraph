@@ -13,6 +13,8 @@ class AccessRecommendationEngine:
     MIN_COHORT_SIZE = 5       # below this we widen the cohort
     MIN_RELIABLE_COHORT = 10  # below this we down-weight AD/ML and up-weight reference
     AD_SMOOTHING_FACTOR = 5   # Laplace pseudo-count added to denominator
+    MAX_COMMON_GROUP_RATE = 0.80
+    MIN_ML_SIMILARITY = 0.25
 
     ROLE_ALIASES = {
         (
@@ -43,6 +45,7 @@ class AccessRecommendationEngine:
         self.matrix_builder = PermissionMatrixBuilder(min_confidence=min_confidence)
         self.permission_filter = PermissionFilter()
         self.title_matcher = title_matcher
+        self._global_group_rates = {}
 
     def recommend_for_hire(
         self,
@@ -99,8 +102,11 @@ class AccessRecommendationEngine:
         )
         merged["EmployeeTypeClean"] = str(employee_type).lower().strip()
         merged["IsFSYRole"] = self._is_fsy_role(title=title, department=department)
+        merged["CohortSize"] = len(comparison_cohort)
+        merged["CohortReliability"] = min(1.0, len(comparison_cohort) / self.MIN_RELIABLE_COHORT)
 
         merged = self.permission_filter.filter_recommendations(merged)
+        merged = self._apply_signal_filters(merged)
 
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
@@ -150,6 +156,14 @@ class AccessRecommendationEngine:
         if matched.empty:
             employee_ref = ref[ref["EmployeeTypeClean"] == employee_type_clean].copy()
             if not employee_ref.empty:
+                # Prevent cross-department leakage (e.g., Finance rights on Help Desk).
+                dept_clean = self._normalize_role_text(department)
+                dept_scoped = employee_ref[
+                    employee_ref["DepartmentClean"] == dept_clean
+                ].copy()
+                if not dept_scoped.empty:
+                    employee_ref = dept_scoped
+
                 candidate_titles = employee_ref["JobTitle"].dropna().astype(str).unique().tolist()
                 embed_matcher = self.title_matcher
                 if embed_matcher is None:
@@ -489,22 +503,39 @@ class AccessRecommendationEngine:
         if row["InReferenceSheet"]:
             score += reference_weight
 
-        if row["ADConfidence"] >= 0.8:
+        cohort_reliability = float(row.get("CohortReliability", 0.0))
+        if row["InReferenceSheet"] or row["CopyFromUserHasIt"]:
+            cohort_reliability = max(cohort_reliability, 0.8)
+        else:
+            cohort_reliability = max(cohort_reliability, 0.5)
+        global_rate = float(row.get("GlobalGroupRate", 0.0))
+        commonality_penalty = max(0.0, 1.0 - max(0.0, global_rate - 0.5))
+        ad_signal = float(row["ADConfidence"]) * cohort_reliability * commonality_penalty
+        ml_signal = float(row["MLConfidence"]) * cohort_reliability * commonality_penalty
+        support_ratio = float(row.get("SupportRatio", 0.0))
+
+        if ad_signal >= 0.8:
             score += ad_weights[0]
-        elif row["ADConfidence"] >= 0.6:
+        elif ad_signal >= 0.6:
             score += ad_weights[1]
-        elif row["ADConfidence"] >= 0.4:
+        elif ad_signal >= 0.4:
             score += ad_weights[2]
 
-        if row["MLConfidence"] >= 0.8:
+        if ml_signal >= 0.8 and support_ratio >= 0.6:
             score += ml_weights[0]
-        elif row["MLConfidence"] >= 0.6:
+        elif ml_signal >= 0.6 and support_ratio >= 0.5:
             score += ml_weights[1]
-        elif row["MLConfidence"] >= 0.4:
+        elif ml_signal >= 0.4 and support_ratio >= 0.4:
             score += ml_weights[2]
 
         if row["CopyFromUserHasIt"]:
             score += copy_weight
+
+        if row["InReferenceSheet"]:
+            score = max(score, reference_weight)
+
+        if row["RiskLevel"] == "High" and not row["InReferenceSheet"]:
+            score *= 0.5
 
         return round(min(score, 1.0), 3)
 
@@ -514,13 +545,13 @@ class AccessRecommendationEngine:
 
         score = row["FinalScore"]
 
-        if score >= 0.80:
+        if score >= 0.85:
             return "Auto Assign"
 
-        if score >= 0.65:
+        if score >= 0.70:
             return "Strong Recommend"
 
-        if score >= 0.45:
+        if score >= 0.50:
             return "Suggest"
 
         if row["CopyFromUserHasIt"] and not row["InReferenceSheet"]:
@@ -559,8 +590,43 @@ class AccessRecommendationEngine:
 
         if not reasons:
             return "No strong evidence found."
+        confidence_bits = (
+            f"score={row.get('FinalScore', 0):.2f}; "
+            f"ad={row.get('ADConfidence', 0):.2f}; "
+            f"ml={row.get('MLConfidence', 0):.2f}; "
+            f"support={int(row.get('MLSupportCount', 0))}/{max(int(row.get('MLComparedUsers', 0)), 1)}; "
+            f"cohort={int(row.get('CohortSize', 0))}; "
+            f"global_rate={row.get('GlobalGroupRate', 0):.2f}"
+        )
+        return "Recommended because it is " + ", and ".join(reasons) + f". Confidence: {confidence_bits}."
 
-        return "Recommended because it is " + ", and ".join(reasons) + "."
+    def _apply_signal_filters(self, merged: pd.DataFrame) -> pd.DataFrame:
+        if merged.empty:
+            return merged
+        df = merged.copy()
+        df["GroupNameNorm"] = df["GroupName"].apply(self._normalize_group_name)
+        df["GlobalGroupRate"] = df["GroupNameNorm"].map(self._global_group_rates).fillna(0.0)
+        df["SupportRatio"] = (
+            df["MLSupportCount"] / df["MLComparedUsers"].replace(0, 1)
+        ).fillna(0.0)
+        df["IsVeryCommon"] = df["GlobalGroupRate"] >= self.MAX_COMMON_GROUP_RATE
+        df["IsLowSignalML"] = (df["MLConfidence"] > 0) & (
+            (df["SupportRatio"] < 0.4) | (df["MLComparedUsers"] < 3)
+        )
+        keep = (
+            df["InReferenceSheet"]
+            | (df["ADConfidence"] >= 0.5)
+            | ((df["MLConfidence"] >= 0.6) & (~df["IsLowSignalML"]))
+            | (df["CopyFromUserHasIt"])
+        )
+        # Suppress very-common groups unless there is structured enterprise signal.
+        keep = keep & (
+            ~df["IsVeryCommon"]
+            | df["InReferenceSheet"]
+            | (df["ADConfidence"] >= 0.6)
+            | df["CopyFromUserHasIt"]
+        )
+        return df[keep].copy()
 
     def _select_ad_comparison_cohort(
         self,
@@ -583,6 +649,7 @@ class AccessRecommendationEngine:
         overlap so that users who "look like" this role float to the top.
         """
         users = users_df.copy()
+        self._global_group_rates = self._compute_global_group_rates(users)
         users["TitleClean"] = users["Title"].apply(self._normalize_role_text)
         users["DepartmentClean"] = users["Department"].apply(self._normalize_role_text)
 
@@ -629,6 +696,16 @@ class AccessRecommendationEngine:
         if candidates:
             return max(candidates, key=len)
         return exact_cohort  # empty DataFrame
+
+    def _compute_global_group_rates(self, users: pd.DataFrame) -> dict[str, float]:
+        if users.empty:
+            return {}
+        total = max(len(users), 1)
+        counts = Counter()
+        for groups in users["GroupsList"]:
+            normalized = {self._normalize_group_name(g) for g in groups}
+            counts.update(normalized)
+        return {k: v / total for k, v in counts.items()}
 
     def _refine_by_reference_overlap(
         self,

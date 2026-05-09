@@ -43,7 +43,7 @@ EXCLUDED_FSY_TITLES = {
 # ---------------------------------------------------------------------------
 
 @st.cache_data
-def load_users(clean_data_path: str) -> pd.DataFrame:
+def load_users(clean_data_path: str, data_mtime: float) -> pd.DataFrame:
     cleaner = DataCleaner(processed_path=clean_data_path)
     return cleaner.load_cleaned()
 
@@ -465,7 +465,8 @@ def main() -> None:
 
     # Load user data
     try:
-        users_df = load_users(clean_path)
+        mtime = Path(clean_path).stat().st_mtime
+        users_df = load_users(clean_path, mtime)
     except Exception as exc:
         st.error(f"Could not load user data: {exc}")
         st.stop()

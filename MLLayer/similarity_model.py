@@ -1,5 +1,6 @@
 import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
+import numpy as np
 
 
 class SimilarityModel:
@@ -22,7 +23,7 @@ class SimilarityModel:
             self.matrix = pd.DataFrame(index=all_users)
             return self
 
-        self.matrix = (
+        raw_matrix = (
             pd.crosstab(
                 index=exploded["SamAccountName"],
                 columns=exploded["GroupsList"],
@@ -31,7 +32,12 @@ class SimilarityModel:
         )
 
         # Important: keep users with zero groups
-        self.matrix = self.matrix.reindex(all_users, fill_value=0)
+        self.matrix = raw_matrix.reindex(all_users, fill_value=0)
+        user_count = max(len(self.matrix), 1)
+        group_counts = self.matrix.sum(axis=0).astype(float)
+        # IDF-like attenuation to prevent common groups from dominating cosine similarity.
+        self.group_idf = np.log((1.0 + user_count) / (1.0 + group_counts)) + 1.0
+        self.weighted_matrix = self.matrix.mul(self.group_idf, axis=1)
 
         return self
 
@@ -44,8 +50,8 @@ class SimilarityModel:
         if self.matrix.shape[1] == 0:
             return pd.DataFrame(columns=["SamAccountName", "MLSimilarityScore"])
 
-        target_vector = self.matrix.loc[[sam_account_name]]
-        scores = cosine_similarity(target_vector, self.matrix)[0]
+        target_vector = self.weighted_matrix.loc[[sam_account_name]]
+        scores = cosine_similarity(target_vector, self.weighted_matrix)[0]
 
         results = pd.DataFrame({
             "SamAccountName": self.matrix.index,

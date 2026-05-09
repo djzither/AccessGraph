@@ -25,6 +25,18 @@ class RightsSheetsLoader:
         "ce fsy us assistant coordinator",
         "ce fsy us wellness coordinator",
     }
+    ALLOWED_ACCESS_CATEGORIES = {
+        "ad rights",
+        "email groups",
+        "crm access",
+        "drupal",
+    }
+    DEPARTMENT_ALIASES = {
+        "fs": "financial services",
+        "fsy": "especially for youth",
+        "mms": "multimedia services",
+        "it": "information technology",
+    }
 
     def __init__(self, raw_path: str):
         self.loader = DataLoader(base_path=raw_path)
@@ -102,8 +114,8 @@ class RightsSheetsLoader:
                     rows.append(
                         {
                             "EmployeeType": employee_type,
-                            "JobTitle": str(job_title).strip(),
-                            "Department": str(department).strip() if pd.notna(department) else None,
+                            "JobTitle": self._normalize_job_title(job_title),
+                            "Department": self._normalize_department(department),
                             "Supervisor": str(supervisor).strip() if pd.notna(supervisor) else None,
                             "ReferenceEmployeeName": (
                                 str(employee_name).strip() if pd.notna(employee_name) else None
@@ -134,6 +146,8 @@ class RightsSheetsLoader:
     @classmethod
     def _should_include_category(cls, category: str) -> bool:
         normalized = cls._normalize_category(category)
+        if normalized not in cls.ALLOWED_ACCESS_CATEGORIES:
+            return False
 
         if normalized in cls.EXCLUDED_ACCESS_CATEGORIES:
             return False
@@ -170,6 +184,9 @@ class RightsSheetsLoader:
                 continue
             if self._is_likely_person_entry(item):
                 continue
+            item = self._clean_access_token(item)
+            if not item:
+                continue
 
 
             cleaned.append(item)
@@ -191,3 +208,39 @@ class RightsSheetsLoader:
             return True
 
         return False
+
+    @classmethod
+    def _normalize_department(cls, value) -> str | None:
+        if pd.isna(value):
+            return None
+        key = " ".join(str(value).lower().strip().split())
+        return cls.DEPARTMENT_ALIASES.get(key, str(value).strip())
+
+    @classmethod
+    def _normalize_job_title(cls, value) -> str:
+        text = str(value).strip()
+        text = re.sub(r"\[.*?\]", "", text)
+        text = re.sub(r"\(.*?combine.*?\)", "", text, flags=re.IGNORECASE)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text
+
+    @classmethod
+    def _clean_access_token(cls, item: str) -> str:
+        token = str(item).strip()
+        token = re.sub(r"^[QIR]\s*\((.*?)\)\s*$", r"\1", token, flags=re.IGNORECASE)
+        token = re.sub(r"\(.*?\)$", "", token).strip()
+        low = token.lower()
+        noise = {
+            "view only",
+            "registrar student",
+            "student employee and assistant",
+            "data entry and materials",
+            "we order",
+        }
+        if low in noise:
+            return ""
+        if re.search(r"\bext\b|\d{3}[- ]?\d{4}", low):
+            return ""
+        if token.startswith("http://") or token.startswith("https://"):
+            return ""
+        return token

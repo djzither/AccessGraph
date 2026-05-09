@@ -5,7 +5,7 @@ from DeterministicLayer.rules_recommender import RulesRecommender
 from MLLayer.recommender import MLRecommender
 
 
-BASE_DIR = Path(__file__).resolve().parent
+BASE_DIR = Path(__file__).resolve().parents[1]
 DATA_PATH = BASE_DIR / "data" / "processed" / "clean_users.parquet"
 
 def classify_review_reason(group_name: str) -> str:
