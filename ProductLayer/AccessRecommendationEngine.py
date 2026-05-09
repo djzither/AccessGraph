@@ -132,7 +132,7 @@ class AccessRecommendationEngine:
         reference_df: pd.DataFrame,
         title: str,
         department: str,
-        employee_type: str,
+        employee_type: str | None,
         supervisor: str | None,
         users_df: pd.DataFrame,
         copy_from_netid: str | None,
@@ -154,18 +154,27 @@ class AccessRecommendationEngine:
             ref["ReferenceEmployeeNameClean"] = ""
 
         role_candidates = self._role_candidates(title=title, department=department)
-        employee_type_clean = str(employee_type).lower().strip()
+        employee_type_clean = (
+            str(employee_type).lower().strip()
+            if employee_type is not None and str(employee_type).strip()
+            else None
+        )
 
         matched = ref[
             ref.apply(
                 lambda row: (row["JobTitleClean"], row["DepartmentClean"]) in role_candidates,
                 axis=1,
             )
-            & (ref["EmployeeTypeClean"] == employee_type_clean)
         ].copy()
 
+        if employee_type_clean is not None:
+            matched = matched[matched["EmployeeTypeClean"] == employee_type_clean].copy()
+
         if matched.empty:
-            employee_ref = ref[ref["EmployeeTypeClean"] == employee_type_clean].copy()
+            if employee_type_clean is not None:
+                employee_ref = ref[ref["EmployeeTypeClean"] == employee_type_clean].copy()
+            else:
+                employee_ref = ref.copy()
             if not employee_ref.empty:
                 # Prevent cross-department leakage (e.g., Finance rights on Help Desk).
                 dept_clean = self._normalize_role_text(department)
@@ -234,8 +243,10 @@ class AccessRecommendationEngine:
             .drop_duplicates()
             .shape[0]
         )
+        missing_employee_type = employee_type_clean is None
+        missing_supervisor = supervisor is None or not str(supervisor).strip()
         ambiguous_template = bool(
-            template_count > 1 and (employee_type is None or supervisor is None)
+            template_count > 1 and (missing_employee_type or missing_supervisor)
         )
 
         grouped = (
@@ -647,7 +658,7 @@ class AccessRecommendationEngine:
             f"score={row.get('FinalScore', 0):.2f}; "
             f"ad={row.get('ADConfidence', 0):.2f}; "
             f"ml={row.get('MLConfidence', 0):.2f}; "
-            f"support={int(row.get('MLSupportCount', 0))}/{max(int(row.get('MLComparedUsers', 0)), 1)}; "
+            f"support={int(row.get('MLSupportCount', 0))}/{int(row.get('MLComparedUsers', 0))}; "
             f"cohort={int(row.get('CohortSize', 0))}; "
             f"global_rate={row.get('GlobalGroupRate', 0):.2f}"
         )
