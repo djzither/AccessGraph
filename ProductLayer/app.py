@@ -26,6 +26,34 @@ from DeterministicLayer.privilege_audit import PrivilegeAuditAnalyzer
 from ProductLayer.AccessRecommendationEngine import AccessRecommendationEngine
 
 
+# ---------------------------------------------------------------------------
+# Demo ServiceNow tickets (parquet from PDF export parser)
+# ---------------------------------------------------------------------------
+# Today: read ``data/processed/demo_servicenow_tickets.parquet`` built by
+# ``python -m scripts.build_demo_ticket_dataset``. Later, the same tab can be
+# fed by live Table API rows (DataLayer/servicenow_loader) with the same
+# column names after normalization — only the loader changes.
+DEMO_SERVICE_NOW_TICKETS_PATH = (
+    Path(__file__).resolve().parent.parent / "data/processed/demo_servicenow_tickets.parquet"
+)
+
+# Display / filter columns (parquet may omit some if built with --no-signal-columns)
+_DEMO_TICKET_TABLE_COLS: tuple[str, ...] = (
+    "Number",
+    "Title",
+    "Ticket Type",
+    "State",
+    "Supervisor",
+    "Employee Type",
+    "Employee Job Title",
+    "DemoSamAccountName",
+    "DemoDisplayName",
+    "MatchConfidence",
+    "_demo_internal_notes_keywords",
+    "_demo_onboarding_ticket",
+)
+
+
 # DEMO_MODE-aware defaults: switch via the ACCESSGRAPH_DEMO_MODE env var
 # (no code edits required — see DataLayer/data_paths.py).
 DEFAULT_CLEAN_DATA_PATH = clean_users_path()
@@ -59,6 +87,12 @@ EXCLUDED_FSY_TITLES = {
 def load_users(clean_data_path: str, data_mtime: float) -> pd.DataFrame:
     cleaner = DataCleaner(processed_path=clean_data_path)
     return filter_user_groups_df(cleaner.load_cleaned())
+
+
+@st.cache_data
+def load_demo_servicenow_tickets(path_str: str, mtime: float) -> pd.DataFrame:
+    """Parquet-only demo tickets; mtime busts cache when the file is rebuilt."""
+    return pd.read_parquet(path_str)
 
 
 @st.cache_data
@@ -693,6 +727,191 @@ def render_orphaned_access_tab(users_df: pd.DataFrame) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Tab 4 — Demo ServiceNow tickets (parquet / future API)
+# ---------------------------------------------------------------------------
+
+def _safe_col(df: pd.DataFrame, name: str) -> pd.Series:
+    if name in df.columns:
+        return df[name]
+    return pd.Series([pd.NA] * len(df), index=df.index)
+
+
+def render_demo_tickets_tab(users_df: pd.DataFrame) -> None:
+    """
+    Show parsed CE tickets from the demo pipeline. Optional: no file → no error.
+
+    To wire a live ServiceNow source later, replace the Parquet read with
+    rows from DataLayer/servicenow_loader and keep the same normalized fields.
+    """
+    st.subheader("Demo ServiceNow tickets")
+    st.caption(
+        "Parsed from exported PDFs by the demo dataset builder. Not the production "
+        "ServiceNow API — a future loader can fill the same columns."
+    )
+
+    if not DEMO_SERVICE_NOW_TICKETS_PATH.is_file():
+        st.info(
+            "No demo ticket file yet. Run "
+            "`python -m scripts.build_demo_ticket_dataset --analysis` first."
+        )
+        return
+
+    try:
+        mtime = DEMO_SERVICE_NOW_TICKETS_PATH.stat().st_mtime
+        tickets_df = load_demo_servicenow_tickets(
+            str(DEMO_SERVICE_NOW_TICKETS_PATH.resolve()),
+            mtime,
+        )
+    except Exception as exc:
+        st.warning(f"Could not read demo tickets parquet: {exc}")
+        return
+
+    if tickets_df.empty:
+        st.warning("Demo tickets file exists but contains no rows.")
+        return
+
+    df = tickets_df.copy()
+
+    # ── Filters ─────────────────────────────────────────────────────────────
+    f1, f2, f3, f4 = st.columns([2, 2, 1, 1])
+    with f1:
+        types = sorted(_safe_col(df, "Ticket Type").dropna().astype(str).unique())
+        type_pick = (
+            st.multiselect(
+                "Ticket Type",
+                options=types,
+                default=types,
+                key="demo_tkt_type",
+            )
+            if types
+            else []
+        )
+    with f2:
+        conf_vals = sorted(_safe_col(df, "MatchConfidence").dropna().astype(str).unique())
+        conf_pick = (
+            st.multiselect(
+                "MatchConfidence",
+                options=conf_vals,
+                default=conf_vals,
+                key="demo_tkt_conf",
+            )
+            if conf_vals
+            else []
+        )
+    with f3:
+        onboarding_only = st.checkbox(
+            "Onboarding tickets only",
+            value=False,
+            key="demo_tkt_onb",
+        )
+    with f4:
+        door_only = st.checkbox(
+            "Door / access keywords only",
+            value=False,
+            key="demo_tkt_door",
+        )
+
+    filtered = df
+    if types and type_pick and "Ticket Type" in filtered.columns:
+        filtered = filtered[filtered["Ticket Type"].astype(str).isin(type_pick)]
+    if conf_vals and conf_pick and "MatchConfidence" in filtered.columns:
+        filtered = filtered[filtered["MatchConfidence"].astype(str).isin(conf_pick)]
+
+    if onboarding_only and "_demo_onboarding_ticket" in filtered.columns:
+        filtered = filtered[filtered["_demo_onboarding_ticket"].astype(bool)]
+
+    if door_only:
+        if "_demo_internal_notes_access_like" in filtered.columns:
+            filtered = filtered[filtered["_demo_internal_notes_access_like"].astype(bool)]
+        elif "_demo_internal_notes_keywords" in filtered.columns:
+            kw = filtered["_demo_internal_notes_keywords"].astype(str).str.strip()
+            filtered = filtered[kw.ne("") & kw.ne("nan")]
+        else:
+            st.caption("Door/access filter skipped — rebuild parquet with signal columns.")
+
+    st.metric("Tickets shown", len(filtered))
+
+    # Summary table
+    show_cols = [c for c in _DEMO_TICKET_TABLE_COLS if c in filtered.columns]
+    if show_cols:
+        st.dataframe(
+            filtered[show_cols],
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        st.dataframe(filtered, use_container_width=True, hide_index=True)
+
+    st.divider()
+    st.markdown("##### Ticket detail")
+
+    for row_i, (_, row) in enumerate(filtered.iterrows()):
+        num = row.get("Number", row_i)
+        num_key = str(num) if pd.notna(num) else str(row_i)
+        title = row.get("Title", "")
+        label = f"{num} — {str(title)[:80]}{'…' if len(str(title)) > 80 else ''}"
+        with st.expander(label):
+            c_a, c_b = st.columns(2)
+            sam = row.get("DemoSamAccountName")
+            sam_s = str(sam).strip() if pd.notna(sam) and str(sam).strip() else ""
+
+            with c_a:
+                st.markdown("**Internal Notes**")
+                st.text_area(
+                    "internal_notes",
+                    value=str(row.get("Internal Notes") or ""),
+                    height=160,
+                    key=f"in_{row_i}_{num_key}",
+                    label_visibility="collapsed",
+                    disabled=True,
+                )
+            with c_b:
+                st.markdown("**Work Log / comments**")
+                st.text_area(
+                    "work_log",
+                    value=str(row.get("Work Log/comments") or ""),
+                    height=160,
+                    key=f"wl_{row_i}_{num_key}",
+                    label_visibility="collapsed",
+                    disabled=True,
+                )
+
+            if sam_s:
+                st.markdown(f"**Matched demo NetID:** `{sam_s}`")
+                known_ids = set(users_df["SamAccountName"].dropna().astype(str).unique())
+                in_corpus = sam_s in known_ids
+                if not in_corpus:
+                    st.warning(
+                        "This NetID is not in the currently loaded user parquet — "
+                        "check **Cleaned user data** in the sidebar."
+                    )
+                if st.button(
+                    "Use this NetID in New Hire Onboarding",
+                    key=f"use_netid_{row_i}_{num_key}",
+                    disabled=not in_corpus,
+                    help="Sets the New hire NetID selectbox on the onboarding tab.",
+                ):
+                    st.session_state["ob_newhire"] = sam_s
+                    st.success(
+                        f"Saved **{sam_s}** as the onboarding New hire NetID. "
+                        "Open **New Hire Onboarding** and run **Generate Recommendations**."
+                    )
+                st.code(sam_s, language=None)
+            else:
+                st.caption("No DemoSamAccountName — identity not matched to sanitized users.")
+
+            with st.expander("Raw export text (debug)", expanded=False):
+                st.text_area(
+                    "raw",
+                    value=str(row.get("raw_text") or ""),
+                    height=220,
+                    key=f"raw_{row_i}_{num_key}",
+                    label_visibility="collapsed",
+                    disabled=True,
+                )
+
+
+# ---------------------------------------------------------------------------
 # App entry point
 # ---------------------------------------------------------------------------
 
@@ -751,10 +970,11 @@ def main() -> None:
         )
 
     # Tabs
-    tab1, tab2, tab3 = st.tabs([
+    tab1, tab2, tab3, tab4 = st.tabs([
         "🧑‍💼 New Hire Onboarding",
         "⚠️ Privilege Audit",
         "🔍 Orphaned Access",
+        "🎫 Demo Tickets",
     ])
 
     with tab1:
@@ -765,6 +985,9 @@ def main() -> None:
 
     with tab3:
         render_orphaned_access_tab(users_df)
+
+    with tab4:
+        render_demo_tickets_tab(users_df)
 
 
 if __name__ == "__main__":
