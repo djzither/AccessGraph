@@ -12,10 +12,45 @@ class MLRecommender:
     def __init__(self, users_df: pd.DataFrame):
         self.users_df = filter_user_groups_df(users_df)
 
+    @staticmethod
+    def _normalize_text(value: object) -> str:
+        return str(value).lower().strip()
+
+    def _role_title_department_pool(
+        self,
+        *,
+        title: str,
+        department: str,
+        include_supervisors: bool = False,
+    ) -> pd.DataFrame:
+        """
+        Build an exact Title + Department cohort.
+
+        This is intentionally strict (normalized equality) to reduce noise from
+        loosely-related department peers and to make duplicate job titles more
+        role-aware.
+        """
+        if "Title" not in self.users_df.columns or "Department" not in self.users_df.columns:
+            return pd.DataFrame(columns=self.users_df.columns)
+
+        title_clean = self._normalize_text(title)
+        department_clean = self._normalize_text(department)
+
+        pool = self.users_df[
+            self.users_df["Title"].astype(str).str.lower().str.strip().eq(title_clean)
+            & self.users_df["Department"].astype(str).str.lower().str.strip().eq(department_clean)
+        ].copy()
+
+        if not include_supervisors and "IsSupervisor" in pool.columns:
+            pool = pool[pool["IsSupervisor"] == False]
+
+        return pool
+
     def _same_department_pool(
         self,
         department: str,
         include_supervisors: bool = False,
+        allow_global_fallback: bool = True,
     ) -> pd.DataFrame:
 
         department_clean = str(department).lower().strip()
@@ -33,11 +68,46 @@ class MLRecommender:
 
         # If the department is too small for a meaningful similarity search,
         # widen to the full dataset so the model has enough variance to work with.
-        if len(pool) < self.MIN_POOL_SIZE:
+        # (This is the historical/default behavior; some callers may disable it
+        # to explicitly enforce a role->dept->global fallback order.)
+        if allow_global_fallback and len(pool) < self.MIN_POOL_SIZE:
             pool = self.users_df.copy()
             if not include_supervisors and "IsSupervisor" in pool.columns:
                 pool = pool[pool["IsSupervisor"] == False]
 
+        return pool
+
+    def _similarity_pool_for_user(
+        self,
+        *,
+        title: str,
+        department: str,
+        include_supervisors: bool = False,
+    ) -> pd.DataFrame:
+        # Fallback order (preserves MIN_POOL_SIZE behavior):
+        # 1) Exact normalized Title + Department cohort (most role-aware)
+        # 2) Department-only cohort (current behavior)
+        # 3) Global cohort (current MIN_POOL_SIZE fallback)
+        role_pool = self._role_title_department_pool(
+            title=title,
+            department=department,
+            include_supervisors=include_supervisors,
+        )
+        if len(role_pool) >= self.MIN_POOL_SIZE:
+            return role_pool
+
+        dept_pool = self._same_department_pool(
+            department=department,
+            include_supervisors=include_supervisors,
+            allow_global_fallback=False,
+        )
+        if len(dept_pool) >= self.MIN_POOL_SIZE:
+            return dept_pool
+
+        # Final fallback: preserve existing behavior by using the full dataset.
+        pool = self.users_df.copy()
+        if not include_supervisors and "IsSupervisor" in pool.columns:
+            pool = pool[pool["IsSupervisor"] == False]
         return pool
 
     def recommend_for_user(
@@ -48,18 +118,30 @@ class MLRecommender:
         min_support: int = 3,
         include_supervisors: bool = False,
     ) -> pd.DataFrame:
-
-        pool = self._same_department_pool(
-            department=department,
-            include_supervisors=include_supervisors,
-        )
-
         target_user = self.users_df[
             self.users_df["SamAccountName"] == sam_account_name
         ]
 
         if target_user.empty:
             raise ValueError(f"{sam_account_name} not found in full user data")
+
+        # Build similarity pool with strict role-first fallback order:
+        # Title+Department -> Department-only -> Global
+        target_title = (
+            target_user["Title"].iloc[0]
+            if "Title" in target_user.columns and len(target_user["Title"]) > 0
+            else ""
+        )
+        target_department = (
+            target_user["Department"].iloc[0]
+            if "Department" in target_user.columns and len(target_user["Department"]) > 0
+            else department
+        )
+        pool = self._similarity_pool_for_user(
+            title=target_title,
+            department=target_department,
+            include_supervisors=include_supervisors,
+        )
 
         pool = pd.concat([pool, target_user], ignore_index=True)
         pool = pool.drop_duplicates(subset=["SamAccountName"])
