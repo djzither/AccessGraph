@@ -220,7 +220,23 @@ class AccessRecommendationEngine:
                 "GroupName",
                 "InReferenceSheet",
                 "ReferenceCategories",
+                "ReferenceTemplateCount",
+                "AmbiguousReferenceTemplate",
             ])
+
+        # Ambiguity detection (mirrors ReferenceMatcher semantics):
+        # Multiple template variants under the same role can remain when
+        # employee_type and/or supervisor context is missing. In that case,
+        # reference-sheet matches are valid signals but should be trusted less
+        # to avoid over-recommending blended supervisor-specific templates.
+        template_count = int(
+            matched[["EmployeeTypeClean", "SupervisorClean"]]
+            .drop_duplicates()
+            .shape[0]
+        )
+        ambiguous_template = bool(
+            template_count > 1 and (employee_type is None or supervisor is None)
+        )
 
         grouped = (
             matched.groupby("AccessNameClean", as_index=False)
@@ -238,6 +254,8 @@ class AccessRecommendationEngine:
         })
 
         grouped["InReferenceSheet"] = True
+        grouped["ReferenceTemplateCount"] = template_count
+        grouped["AmbiguousReferenceTemplate"] = ambiguous_template
 
         return grouped
     def _get_ad_recommendations(
@@ -482,6 +500,8 @@ class AccessRecommendationEngine:
         merged["MLComparedUsers"] = merged["MLComparedUsers"].fillna(0).astype(int)
 
         merged["ReferenceCategories"] = merged["ReferenceCategories"].fillna("")
+        merged["ReferenceTemplateCount"] = merged["ReferenceTemplateCount"].fillna(0).astype(int)
+        merged["AmbiguousReferenceTemplate"] = merged["AmbiguousReferenceTemplate"].fillna(False)
         merged["NearestUsers"] = merged["NearestUsers"].fillna("")
         merged["MLMode"] = merged["MLMode"].fillna("")
         merged["MLAnchorNetID"] = merged["MLAnchorNetID"].fillna("")
@@ -513,8 +533,14 @@ class AccessRecommendationEngine:
             ml_weights = (0.10, 0.05, 0.03)
             copy_weight = 0.05
 
-        if row["InReferenceSheet"]:
+        is_ambiguous_ref = bool(row.get("AmbiguousReferenceTemplate", False))
+
+        if row["InReferenceSheet"] and not is_ambiguous_ref:
             score += reference_weight
+        elif row["InReferenceSheet"] and is_ambiguous_ref:
+            # Conservative fallback for blended templates: keep some reference
+            # influence, but avoid giving it full "strong structured signal" weight.
+            score += reference_weight * 0.5
 
         cohort_reliability = float(row.get("CohortReliability", 0.0))
         if row["InReferenceSheet"] or row["CopyFromUserHasIt"]:
@@ -544,7 +570,7 @@ class AccessRecommendationEngine:
         if row["CopyFromUserHasIt"]:
             score += copy_weight
 
-        if row["InReferenceSheet"]:
+        if row["InReferenceSheet"] and not is_ambiguous_ref:
             score = max(score, reference_weight)
 
         if row["RiskLevel"] == "High" and not row["InReferenceSheet"]:
@@ -577,6 +603,11 @@ class AccessRecommendationEngine:
 
         if row["InReferenceSheet"]:
             reasons.append("listed in the access reference sheet")
+            if bool(row.get("AmbiguousReferenceTemplate", False)):
+                reasons.append(
+                    "reference template is ambiguous "
+                    f"({int(row.get('ReferenceTemplateCount', 0))} templates)"
+                )
 
         if row["ADConfidence"] > 0:
             reasons.append(
