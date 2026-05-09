@@ -11,6 +11,13 @@ import streamlit as st
 
 from DataLayer.access_exclusions import filter_reference_df, filter_recommendations_df, filter_user_groups_df
 from DataLayer.cleaner import DataCleaner
+from DataLayer.data_paths import (
+    access_reference_path,
+    clean_users_path,
+    is_demo_mode,
+    mode_label,
+    raw_data_dir,
+)
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
 from DataLayer.permission_cooccurrence import build_cooccurrence_state, cooccurrence_from_state
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
@@ -19,8 +26,11 @@ from DeterministicLayer.privilege_audit import PrivilegeAuditAnalyzer
 from ProductLayer.AccessRecommendationEngine import AccessRecommendationEngine
 
 
-DEFAULT_CLEAN_DATA_PATH = Path("data/processed/clean_users.parquet")
-DEFAULT_RAW_DATA_PATH = Path("data/raw")
+# DEMO_MODE-aware defaults: switch via the ACCESSGRAPH_DEMO_MODE env var
+# (no code edits required — see DataLayer/data_paths.py).
+DEFAULT_CLEAN_DATA_PATH = clean_users_path()
+DEFAULT_RAW_DATA_PATH = raw_data_dir()
+DEFAULT_REFERENCE_DATA_PATH = access_reference_path()
 
 # Decision label → (icon, background colour)
 DECISION_BADGE: dict[str, tuple[str, str]] = {
@@ -53,6 +63,13 @@ def load_users(clean_data_path: str, data_mtime: float) -> pd.DataFrame:
 
 @st.cache_data
 def load_reference(raw_data_path: str) -> pd.DataFrame:
+    # In demo mode the raw xlsx files are not shipped — load the sanitized
+    # access_reference parquet directly so the engine still has reference signal.
+    if is_demo_mode():
+        try:
+            return filter_reference_df(pd.read_parquet(DEFAULT_REFERENCE_DATA_PATH))
+        except Exception:
+            return pd.DataFrame()
     try:
         loader = RightsSheetsLoader(raw_path=raw_data_path)
         return filter_reference_df(loader.load_reference_sheets())
@@ -690,6 +707,17 @@ def main() -> None:
     # Sidebar — data paths
     with st.sidebar:
         st.header("Data Sources")
+        if is_demo_mode():
+            st.success(
+                "🟢 Demo mode active — loading sanitized data from "
+                "`data/demo_processed/`. Unset `ACCESSGRAPH_DEMO_MODE` to "
+                "switch back to real data."
+            )
+        else:
+            st.caption(
+                f"Mode: **{mode_label()}** — set `ACCESSGRAPH_DEMO_MODE=1` to "
+                "load sanitized demo data."
+            )
         clean_path = st.text_input(
             "Cleaned user data (parquet)",
             value=str(DEFAULT_CLEAN_DATA_PATH),
