@@ -71,9 +71,29 @@ class ReferenceMatcher:
 
         role_access_names = set(role_reference["AccessNameClean"])
 
+        # Ambiguity detection:
+        # The collision report shows many JobTitle+Department combinations map to
+        # multiple supervisor-specific templates with low access overlap.
+        # If we cannot narrow by employee_type and/or supervisor, a reference-sheet
+        # "match" may reflect the wrong template, so we treat it conservatively.
+        if role_reference.empty:
+            template_count = 0
+        else:
+            template_count = int(
+                role_reference[["EmployeeTypeClean", "SupervisorClean"]]
+                .drop_duplicates()
+                .shape[0]
+            )
+        ambiguous_template = bool(
+            template_count > 1 and (employee_type is None or supervisor is None)
+        )
+
         recommendations["GroupNameClean"] = (
             recommendations["GroupName"].astype(str).str.lower().str.strip()
         )
+
+        recommendations["ReferenceTemplateCount"] = template_count
+        recommendations["AmbiguousReferenceTemplate"] = ambiguous_template
 
         recommendations["ReferenceSheetMatch"] = recommendations["GroupNameClean"].apply(
             lambda group: group in role_access_names
@@ -114,6 +134,15 @@ class ReferenceMatcher:
         if risk == "High":
             return "Manual Review"
 
+        # Conservative handling for ambiguous templates:
+        # If multiple templates remain and we don't have enough context to choose
+        # the correct one (missing employee_type and/or supervisor), we avoid
+        # over-trusting the reference sheet.
+        if bool(row.get("AmbiguousReferenceTemplate")) and sheet_match:
+            if score >= 0.8:
+                return "Suggest"
+            return "Manual Review"
+
         if sheet_match and score >= 0.8:
             return "Strong Recommend"
 
@@ -142,6 +171,13 @@ class ReferenceMatcher:
         count = row["UserCountWithGroup"]
         total = row["TotalUsersInRole"]
         sheet_match = row["ReferenceSheetMatch"]
+
+        if bool(row.get("AmbiguousReferenceTemplate")):
+            return (
+                "Reference sheet match is ambiguous across "
+                f"{int(row.get('ReferenceTemplateCount', 0))} templates; "
+                f"{count}/{total} similar-user support."
+            )
 
         if sheet_match:
             return f"Found in {count}/{total} similar users and listed in reference sheet."
