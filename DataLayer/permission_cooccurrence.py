@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import dataclass
 from typing import Iterable
 
 import pandas as pd
@@ -63,62 +64,73 @@ def global_permission_counts(
     return n_users, counts
 
 
-def cooccurrence_with_target(
+_EMPTY_COOC_COLUMNS = [
+    "co_permission",
+    "users_with_target",
+    "users_with_b",
+    "users_with_both",
+    "p_b_given_a",
+    "p_a_given_b",
+    "jaccard",
+    "lift",
+    "overlap_pct",
+    "example_users_overlap",
+]
+
+
+def _empty_cooc_df() -> pd.DataFrame:
+    return pd.DataFrame(columns=_EMPTY_COOC_COLUMNS)
+
+
+@dataclass(frozen=True)
+class CooccurrenceState:
+    """Single scan of users: reuse for many target permissions without re-reading rows."""
+
+    pairs: list[tuple[str, set[str]]]
+    global_counts: Counter
+    n_users: int
+
+
+def build_cooccurrence_state(
     users_df: pd.DataFrame,
+    *,
+    groups_column: str = "GroupsList",
+    id_column: str = "SamAccountName",
+    permission_filter: PermissionFilter | None = None,
+) -> CooccurrenceState:
+    pf = permission_filter or PermissionFilter()
+    pairs: list[tuple[str, set[str]]] = list(
+        iter_user_group_sets(
+            users_df,
+            groups_column=groups_column,
+            id_column=id_column,
+            permission_filter=pf,
+        )
+    )
+    global_counts: Counter = Counter()
+    for _uid, groups in pairs:
+        global_counts.update(groups)
+    return CooccurrenceState(pairs=pairs, global_counts=global_counts, n_users=len(pairs))
+
+
+def cooccurrence_from_state(
+    state: CooccurrenceState,
     target_permission: str,
     *,
     top_n: int = 20,
-    groups_column: str = "GroupsList",
-    id_column: str = "SamAccountName",
     max_example_users: int = 5,
-    permission_filter: PermissionFilter | None = None,
 ) -> pd.DataFrame:
     """
-    For a target permission A, summarize co-occurrence with every other permission B.
-
-    Columns:
-    - co_permission (B)
-    - users_with_target (|A|)
-    - users_with_b (|B|)
-    - users_with_both (|A ∩ B|)
-    - p_b_given_a  P(B|A)
-    - p_a_given_b  P(A|B)
-    - jaccard
-    - lift  (P(A∩B) / (P(A)*P(B))) = users_both * N / (users_a * users_b)
-    - overlap_pct  same as P(B|A) as percentage (handy for reporting)
-    - example_users_overlap  sample NetIDs with both A and B
+    Same output schema as cooccurrence_with_target, using a pre-built CooccurrenceState.
     """
     target = str(target_permission).strip()
     if not target:
-        return pd.DataFrame(
-            columns=[
-                "co_permission",
-                "users_with_target",
-                "users_with_b",
-                "users_with_both",
-                "p_b_given_a",
-                "p_a_given_b",
-                "jaccard",
-                "lift",
-                "overlap_pct",
-                "example_users_overlap",
-            ]
-        )
+        return _empty_cooc_df()
 
-    pf = permission_filter or PermissionFilter()
-    global_counts: Counter = Counter()
     cooc_counts: Counter = Counter()
     examples_for_b: dict[str, list[str]] = {}
-    n_users = 0
 
-    for uid, groups in iter_user_group_sets(
-        users_df,
-        groups_column=groups_column,
-        id_column=id_column,
-        permission_filter=pf,
-    ):
-        n_users += 1
-        global_counts.update(groups)
+    for uid, groups in state.pairs:
         if target not in groups:
             continue
         for b in groups:
@@ -130,23 +142,12 @@ def cooccurrence_with_target(
             if len(examples_for_b[b]) < max_example_users:
                 examples_for_b[b].append(uid)
 
-    users_a = global_counts.get(target, 0)
+    users_a = state.global_counts.get(target, 0)
     if users_a == 0:
-        return pd.DataFrame(
-            columns=[
-                "co_permission",
-                "users_with_target",
-                "users_with_b",
-                "users_with_both",
-                "p_b_given_a",
-                "p_a_given_b",
-                "jaccard",
-                "lift",
-                "overlap_pct",
-                "example_users_overlap",
-            ]
-        )
+        return _empty_cooc_df()
 
+    n_users = state.n_users
+    global_counts = state.global_counts
     rows: list[dict] = []
     for b, both in cooc_counts.items():
         ub = global_counts.get(b, 0)
@@ -179,20 +180,7 @@ def cooccurrence_with_target(
         )
 
     if not rows:
-        return pd.DataFrame(
-            columns=[
-                "co_permission",
-                "users_with_target",
-                "users_with_b",
-                "users_with_both",
-                "p_b_given_a",
-                "p_a_given_b",
-                "jaccard",
-                "lift",
-                "overlap_pct",
-                "example_users_overlap",
-            ]
-        )
+        return _empty_cooc_df()
 
     out = pd.DataFrame(rows)
     out = out.sort_values(
@@ -200,3 +188,42 @@ def cooccurrence_with_target(
         ascending=[False, False, False],
     ).head(top_n)
     return out.reset_index(drop=True)
+
+
+def cooccurrence_with_target(
+    users_df: pd.DataFrame,
+    target_permission: str,
+    *,
+    top_n: int = 20,
+    groups_column: str = "GroupsList",
+    id_column: str = "SamAccountName",
+    max_example_users: int = 5,
+    permission_filter: PermissionFilter | None = None,
+) -> pd.DataFrame:
+    """
+    For a target permission A, summarize co-occurrence with every other permission B.
+
+    Columns:
+    - co_permission (B)
+    - users_with_target (|A|)
+    - users_with_b (|B|)
+    - users_with_both (|A ∩ B|)
+    - p_b_given_a  P(B|A)
+    - p_a_given_b  P(A|B)
+    - jaccard
+    - lift  (P(A∩B) / (P(A)*P(B))) = users_both * N / (users_a * users_b)
+    - overlap_pct  same as P(B|A) as percentage (handy for reporting)
+    - example_users_overlap  sample NetIDs with both A and B
+    """
+    state = build_cooccurrence_state(
+        users_df,
+        groups_column=groups_column,
+        id_column=id_column,
+        permission_filter=permission_filter,
+    )
+    return cooccurrence_from_state(
+        state,
+        target_permission,
+        top_n=top_n,
+        max_example_users=max_example_users,
+    )

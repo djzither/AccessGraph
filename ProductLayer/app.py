@@ -12,6 +12,7 @@ import streamlit as st
 from DataLayer.access_exclusions import filter_reference_df, filter_recommendations_df, filter_user_groups_df
 from DataLayer.cleaner import DataCleaner
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
+from DataLayer.permission_cooccurrence import build_cooccurrence_state, cooccurrence_from_state
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_analyzer import AccessPatternAnalyzer
 from DeterministicLayer.privilege_audit import PrivilegeAuditAnalyzer
@@ -98,6 +99,41 @@ def _filter_excluded_fsy_roles(users_df: pd.DataFrame) -> pd.DataFrame:
     return filtered[~title_norm.isin(EXCLUDED_FSY_TITLES)].copy()
 
 
+def _render_cooccurrence_table(co_state, gname: str, co_top_n: int) -> None:
+    """Display top co-permissions for a target group (explainability only)."""
+    co_df = cooccurrence_from_state(
+        co_state,
+        gname,
+        top_n=int(co_top_n),
+        max_example_users=5,
+    )
+    if co_df.empty:
+        st.caption("No strong co-occurring permissions found.")
+        return
+    view = co_df[
+        [
+            "co_permission",
+            "users_with_both",
+            "p_b_given_a",
+            "jaccard",
+            "lift",
+            "example_users_overlap",
+        ]
+    ].copy()
+    view["P(co|target)"] = view["p_b_given_a"].apply(lambda x: f"{float(x):.1%}")
+    view = view.drop(columns=["p_b_given_a"])
+    view = view.rename(
+        columns={
+            "co_permission": "Co-permission",
+            "users_with_both": "Users with both",
+            "jaccard": "Jaccard",
+            "lift": "Lift",
+            "example_users_overlap": "Example users",
+        }
+    )
+    st.dataframe(view, use_container_width=True, hide_index=True)
+
+
 # ---------------------------------------------------------------------------
 # Tab 1 — New Hire Onboarding
 # ---------------------------------------------------------------------------
@@ -156,6 +192,31 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
         value=False,
         key="ob_subgroup",
     )
+    show_cooccurrence = st.checkbox(
+        "Show permission co-occurrence insights (explainability only; does not change scores)",
+        value=False,
+        key="ob_cooc",
+    )
+    co_top_n = 8
+    co_row_cap = 40
+    if show_cooccurrence:
+        cco1, cco2 = st.columns(2)
+        with cco1:
+            co_top_n = st.slider(
+                "Co-permissions per recommendation",
+                min_value=5,
+                max_value=10,
+                value=8,
+                key="ob_co_top",
+            )
+        with cco2:
+            co_row_cap = st.slider(
+                "Max recommendations with detail expanders",
+                min_value=10,
+                max_value=80,
+                value=40,
+                key="ob_co_rows",
+            )
 
     # Cohort preview before running
     cohort_size = len(
@@ -247,10 +308,12 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
 
     st.dataframe(display, use_container_width=True, hide_index=True)
 
-    # Subgroup diagnostics: explainability only (same cohort selection as AD peer counts).
+    # --- Explainability: subgroup (engine cohort) + co-occurrence (dataset-wide, one index build)
+    sub_df = pd.DataFrame()
+    subgroup_by_perm: dict = {}
+    cohort_size = 0
+
     if show_subgroup_diagnostics:
-        sub_df = pd.DataFrame()
-        cohort_size = 0
         with st.spinner("Computing subgroup diagnostics (engine AD cohort)…"):
             try:
                 reference_recs = engine._get_reference_recommendations(
@@ -278,23 +341,74 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
             except Exception as exc:
                 st.warning(f"Subgroup diagnostics unavailable: {exc}")
 
-        if not sub_df.empty:
-            subgroup_by_perm = {
-                str(row["permission"]): row
-                for _, row in sub_df.iterrows()
-            }
-            st.divider()
-            st.markdown("#### Subgroup diagnostics")
-            st.caption(
-                f"Explainability only — engine-selected AD comparison cohort "
-                f"**({cohort_size} users)**. Does **not** change scores or decisions."
+    if not sub_df.empty:
+        subgroup_by_perm = {str(row["permission"]): row for _, row in sub_df.iterrows()}
+
+    co_state = None
+    if show_cooccurrence:
+        with st.spinner("Indexing users for co-occurrence (one pass over cleaned users)…"):
+            try:
+                co_state = build_cooccurrence_state(users_for_recs)
+            except Exception as exc:
+                st.warning(f"Co-occurrence indexing failed: {exc}")
+
+    has_subsection = (show_subgroup_diagnostics and bool(subgroup_by_perm)) or (
+        show_cooccurrence and co_state is not None
+    )
+    if show_subgroup_diagnostics and sub_df.empty and not (show_cooccurrence and co_state is not None):
+        st.caption("Subgroup diagnostics: no rows returned (empty cohort or unavailable).")
+
+    if has_subsection:
+        st.divider()
+        st.markdown("#### Explainability")
+        cap_bits = []
+        if show_subgroup_diagnostics and subgroup_by_perm:
+            cap_bits.append(
+                f"Subgroup: engine AD comparison cohort **({cohort_size} users)**."
             )
-            for _, rrow in recs.iterrows():
-                gname = str(rrow["GroupName"])
-                if gname not in subgroup_by_perm:
-                    continue
-                diag = subgroup_by_perm[gname]
-                assessment = str(diag.get("subgroup_assessment", "Rare Access"))
+        if show_cooccurrence and co_state is not None:
+            cap_bits.append(
+                f"Co-occurrence: **{co_state.n_users}** users in loaded dataset (FSY-excluded slice)."
+            )
+        st.caption(
+            " ".join(cap_bits)
+            + " Does **not** change scores, FinalDecision, or FinalScore."
+        )
+
+    if not has_subsection:
+        return
+
+    recs_sorted = recs.sort_values(
+        by=["FinalScore", "GroupName"],
+        ascending=[False, True],
+    )
+    row_cap = int(co_row_cap) if show_cooccurrence else len(recs_sorted)
+    iter_recs = recs_sorted.head(row_cap)
+
+    for _, rrow in iter_recs.iterrows():
+        gname = str(rrow["GroupName"])
+        has_sub = show_subgroup_diagnostics and gname in subgroup_by_perm
+        has_co = bool(show_cooccurrence and co_state is not None)
+
+        if show_subgroup_diagnostics and not show_cooccurrence:
+            if not has_sub:
+                continue
+        elif show_cooccurrence and not show_subgroup_diagnostics:
+            if not has_co:
+                continue
+        else:
+            if not has_sub and not has_co:
+                continue
+
+        if has_sub:
+            diag = subgroup_by_perm[gname]
+            assessment = str(diag.get("subgroup_assessment", "Rare Access"))
+            expander_label = f"{gname} — {assessment}"
+        else:
+            expander_label = f"{gname} — co-occurrence"
+
+        with st.expander(expander_label, expanded=False):
+            if has_sub:
                 specialized = assessment == "Subrole Access"
                 with_users = diag.get("users_with_permission") or []
                 without_users = diag.get("users_without_permission") or []
@@ -302,52 +416,55 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
                 without_shared = diag.get("without_shared_permissions") or []
                 indicators = diag.get("strongest_subgroup_indicators") or []
 
-                label = f"{gname} — {assessment}"
-                with st.expander(label, expanded=False):
-                    st.markdown(
-                        "**Specialized subgroup (permission pattern):** "
-                        + (
-                            "Yes — holders share other permissions at high rate vs non-holders "
-                            "(suggests a functional sub-slice)."
-                            if specialized
-                            else "No — pattern fits rare or broad cohort access (no strong subrole lift)."
-                        )
+                st.markdown("### Subgroup")
+                st.markdown(
+                    "**Specialized subgroup (permission pattern):** "
+                    + (
+                        "Yes — holders share other permissions at high rate vs non-holders "
+                        "(suggests a functional sub-slice)."
+                        if specialized
+                        else "No — pattern fits rare or broad cohort access (no strong subrole lift)."
                     )
-                    st.markdown(f"**Subgroup assessment:** `{assessment}`")
-                    c1, c2 = st.columns(2)
-                    with c1:
-                        st.markdown(
-                            f"**Users with this permission:** {len(with_users)} "
-                            f"— `{', '.join(with_users)}`"
-                            if with_users
-                            else "**Users with this permission:** 0"
-                        )
-                    with c2:
-                        st.markdown(
-                            f"**Users without:** {len(without_users)} "
-                            f"— `{', '.join(without_users)}`"
-                            if without_users
-                            else "**Users without:** 0"
-                        )
-                    st.markdown("**Shared permissions among holders** (high support within “with” slice):")
-                    if with_shared:
-                        st.markdown("\n".join(f"- `{p}`" for p in with_shared))
-                    else:
-                        st.caption("None above default frequency threshold.")
-                    st.markdown("**Contrast — commonly shared by users without this permission:**")
-                    if without_shared:
-                        st.markdown("\n".join(f"- `{p}`" for p in without_shared))
-                    else:
-                        st.caption("None above default frequency threshold.")
-                    st.markdown("**Strongest subgroup indicators** (lift = rate_with − rate_without):")
-                    if indicators:
-                        st.dataframe(
-                            pd.DataFrame(indicators),
-                            use_container_width=True,
-                            hide_index=True,
-                        )
-                    else:
-                        st.caption("No indicators passed default lift/support thresholds.")
+                )
+                st.markdown(f"**Subgroup assessment:** `{assessment}`")
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.markdown(
+                        f"**Users with this permission:** {len(with_users)} "
+                        f"— `{', '.join(with_users)}`"
+                        if with_users
+                        else "**Users with this permission:** 0"
+                    )
+                with c2:
+                    st.markdown(
+                        f"**Users without:** {len(without_users)} "
+                        f"— `{', '.join(without_users)}`"
+                        if without_users
+                        else "**Users without:** 0"
+                    )
+                st.markdown("**Shared permissions among holders** (high support within “with” slice):")
+                if with_shared:
+                    st.markdown("\n".join(f"- `{p}`" for p in with_shared))
+                else:
+                    st.caption("None above default frequency threshold.")
+                st.markdown("**Contrast — commonly shared by users without this permission:**")
+                if without_shared:
+                    st.markdown("\n".join(f"- `{p}`" for p in without_shared))
+                else:
+                    st.caption("None above default frequency threshold.")
+                st.markdown("**Strongest subgroup indicators** (lift = rate_with − rate_without):")
+                if indicators:
+                    st.dataframe(
+                        pd.DataFrame(indicators),
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+                else:
+                    st.caption("No indicators passed default lift/support thresholds.")
+
+            if has_co:
+                st.markdown("### Permission co-occurrence")
+                _render_cooccurrence_table(co_state, gname, co_top_n)
 
 
 # ---------------------------------------------------------------------------
