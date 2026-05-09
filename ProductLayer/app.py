@@ -67,7 +67,7 @@ def load_reference(raw_data_path: str) -> pd.DataFrame:
 def _empty_reference_df() -> pd.DataFrame:
     """Properly-structured empty DataFrame to pass when reference sheets are missing."""
     return pd.DataFrame(columns=[
-        "JobTitle", "Department", "EmployeeType", "Supervisor",
+        "JobTitle", "Department", "EmployeeType", "EmployeeTypeCanonical", "Supervisor",
         "ReferenceEmployeeName", "AccessCategory", "AccessName",
         "AccessNameClean", "SourceFile",
     ])

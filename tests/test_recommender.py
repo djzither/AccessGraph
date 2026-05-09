@@ -54,6 +54,7 @@ def test_recommend_for_user_returns_missing_rights_from_similar_users():
 
     assert "Email" in results["GroupName"].tolist()
     assert "VPN" not in results["GroupName"].tolist()
+    assert "MLWorkforcePoolFallback" in results.columns
 
     row = results.set_index("GroupName").loc["Email"]
     assert row["MLSupportCount"] == 2

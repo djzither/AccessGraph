@@ -4,6 +4,8 @@ import shutil
 import pandas as pd
 
 from DataLayer.access_exclusions import is_excluded_permission
+from DataLayer.permission_normalization import normalize_groups_input
+from DataLayer.workforce_type import FULL_TIME_STAFF_AD_GROUP, classify_from_normalized_groups
 
 
 class DataCleaner:
@@ -18,22 +20,27 @@ class DataCleaner:
 
         def process_groups(group_str):
             if pd.isna(group_str):
-                return []
-
-            groups = [g.strip() for g in str(group_str).split(";")]
+                base: list[str] = []
+            else:
+                base = normalize_groups_input(group_str)
 
             cleaned = [
-                g for g in groups
+                g
+                for g in base
                 if g
                 and not g.startswith("Cannot find an object")
                 and "Cannot find an object with identity" not in g
-                and not self.AD_GROUP_PREFIX_PATTERN.match(g)
+                and (
+                    g == FULL_TIME_STAFF_AD_GROUP
+                    or not self.AD_GROUP_PREFIX_PATTERN.match(g)
+                )
                 and not is_excluded_permission(g)
             ]
 
             return cleaned
 
         df["GroupsList"] = df["Groups"].apply(process_groups)
+        df["EmployeeType"] = df["GroupsList"].apply(classify_from_normalized_groups)
         df["CleanGroupCount"] = df["GroupsList"].apply(len)
 
         return df

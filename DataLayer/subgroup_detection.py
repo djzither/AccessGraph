@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list
+from DataLayer.permission_normalization import normalize_single_permission
 
 
 @dataclass(frozen=True)
@@ -18,7 +19,7 @@ class SubgroupDetectionConfig:
 
 
 def _normalize_group(value: object) -> str:
-    return str(value).strip()
+    return normalize_single_permission(value) or ""
 
 
 def _user_groups_map(users_df: pd.DataFrame) -> dict[str, set[str]]:

@@ -8,6 +8,11 @@ from DataLayer.access_exclusions import (
     filter_reference_df,
     filter_user_groups_df,
 )
+from DataLayer.permission_normalization import normalize_single_permission
+from DataLayer.workforce_type import (
+    canonical_from_ui_label,
+    reference_match_value,
+)
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_labels import apply_access_pattern_columns
 from DeterministicLayer.permission_filter import PermissionFilter
@@ -68,6 +73,7 @@ class AccessRecommendationEngine:
     ) -> pd.DataFrame:
         users_df = filter_user_groups_df(users_df)
         reference_df = filter_reference_df(reference_df)
+        target_canonical = canonical_from_ui_label(employee_type)
 
         reference_recs = self._get_reference_recommendations(
             reference_df=reference_df,
@@ -97,6 +103,7 @@ class AccessRecommendationEngine:
             new_hire_netid=new_hire_netid,
             department=department,
             comparison_cohort=comparison_cohort,
+            workforce_segment=target_canonical,
         )
 
         copy_from_recs = self._get_copy_from_recommendations(
@@ -110,7 +117,15 @@ class AccessRecommendationEngine:
             ml_recs=ml_recs,
             copy_from_recs=copy_from_recs,
         )
+        wattrs = getattr(comparison_cohort, "attrs", None) or {}
+        mix = wattrs.get("workforce_mix") or {}
+        mix_str = ", ".join(f"{k}={v}" for k, v in sorted(mix.items()))
+
         merged["EmployeeTypeClean"] = str(employee_type).lower().strip()
+        merged["WorkforceSegmentTarget"] = target_canonical
+        merged["CohortWorkforceTarget"] = wattrs.get("workforce_target", target_canonical)
+        merged["CohortWorkforceFallback"] = bool(wattrs.get("workforce_fallback", False))
+        merged["CohortEmployeeTypeMix"] = mix_str
         merged["IsFSYRole"] = self._is_fsy_role(title=title, department=department)
         merged["CohortSize"] = len(comparison_cohort)
         merged["CohortReliability"] = min(1.0, len(comparison_cohort) / self.MIN_RELIABLE_COHORT)
@@ -163,7 +178,7 @@ class AccessRecommendationEngine:
 
         role_candidates = self._role_candidates(title=title, department=department)
         employee_type_clean = (
-            str(employee_type).lower().strip()
+            reference_match_value(canonical_from_ui_label(employee_type))
             if employee_type is not None and str(employee_type).strip()
             else None
         )
@@ -340,17 +355,23 @@ class AccessRecommendationEngine:
         new_hire_netid: str | None,
         department: str,
         comparison_cohort: pd.DataFrame,
+        workforce_segment: str,
     ) -> pd.DataFrame:
 
         ml = MLRecommender(users_df)
 
         if new_hire_netid is not None:
+            target_user = users_df[users_df["SamAccountName"] == new_hire_netid]
+            segment = workforce_segment
+            if not target_user.empty and "EmployeeType" in target_user.columns:
+                segment = str(target_user.iloc[0]["EmployeeType"])
             recs = ml.recommend_for_user(
                 sam_account_name=new_hire_netid,
                 department=department,
                 top_n_users=5,
                 min_support=2,
                 include_supervisors=False,
+                workforce_segment=segment,
             )
             ml_mode = "target_user"
             ml_anchor_netid = new_hire_netid
@@ -358,6 +379,10 @@ class AccessRecommendationEngine:
             recs = ml.recommend_for_peer_cohort(
                 cohort_df=comparison_cohort,
                 min_support=2,
+                workforce_segment=workforce_segment,
+                peer_aggregate_fallback=getattr(comparison_cohort, "attrs", {}).get(
+                    "workforce_fallback", False
+                ),
             )
             ml_mode = "peer_aggregate"
             ml_anchor_netid = ""
@@ -371,10 +396,13 @@ class AccessRecommendationEngine:
                 "NearestUsers",
                 "MLMode",
                 "MLAnchorNetID",
+                "MLWorkforcePoolFallback",
             ])
 
         recs["MLMode"] = recs.get("MLMode", ml_mode)
         recs["MLAnchorNetID"] = ml_anchor_netid
+        if "MLWorkforcePoolFallback" not in recs.columns:
+            recs["MLWorkforcePoolFallback"] = False
 
         return recs[
             [
@@ -385,6 +413,7 @@ class AccessRecommendationEngine:
                 "NearestUsers",
                 "MLMode",
                 "MLAnchorNetID",
+                "MLWorkforcePoolFallback",
             ]
         ]
 
@@ -533,6 +562,10 @@ class AccessRecommendationEngine:
         merged["NearestUsers"] = merged["NearestUsers"].fillna("")
         merged["MLMode"] = merged["MLMode"].fillna("")
         merged["MLAnchorNetID"] = merged["MLAnchorNetID"].fillna("")
+        if "MLWorkforcePoolFallback" not in merged.columns:
+            merged["MLWorkforcePoolFallback"] = False
+        else:
+            merged["MLWorkforcePoolFallback"] = merged["MLWorkforcePoolFallback"].fillna(False)
         merged["CopyFromNetID"] = merged["CopyFromNetID"].fillna("")
 
         merged["Score"] = merged["ADConfidence"]
@@ -577,8 +610,16 @@ class AccessRecommendationEngine:
             cohort_reliability = max(cohort_reliability, 0.5)
         global_rate = float(row.get("GlobalGroupRate", 0.0))
         commonality_penalty = max(0.0, 1.0 - max(0.0, global_rate - 0.5))
-        ad_signal = float(row["ADConfidence"]) * cohort_reliability * commonality_penalty
-        ml_signal = float(row["MLConfidence"]) * cohort_reliability * commonality_penalty
+        workforce_penalty = 0.85 if (
+            bool(row.get("CohortWorkforceFallback", False))
+            or bool(row.get("MLWorkforcePoolFallback", False))
+        ) else 1.0
+        ad_signal = (
+            float(row["ADConfidence"]) * cohort_reliability * commonality_penalty * workforce_penalty
+        )
+        ml_signal = (
+            float(row["MLConfidence"]) * cohort_reliability * commonality_penalty * workforce_penalty
+        )
         support_ratio = float(row.get("SupportRatio", 0.0))
 
         if ad_signal >= 0.8:
@@ -640,6 +681,13 @@ class AccessRecommendationEngine:
         if row["ADConfidence"] > 0:
             reasons.append(
                 f"found in {row['UserCountWithGroup']}/{row['TotalUsersInRole']} matching AD users"
+            )
+
+        if bool(row.get("CohortWorkforceFallback", False)) or bool(
+            row.get("MLWorkforcePoolFallback", False)
+        ):
+            reasons.append(
+                "compared across mixed workforce segments (reduced confidence)"
             )
 
         if row["MLConfidence"] > 0:
@@ -729,6 +777,39 @@ class AccessRecommendationEngine:
         )
         return filter_recommendations_df(df[keep].copy())
 
+    def _cohort_with_workforce(
+        self,
+        cohort: pd.DataFrame,
+        target_canonical: str,
+    ) -> pd.DataFrame:
+        """Prefer users with the same WorkforceSegment; widen with attrs when too small."""
+        meta = {
+            "workforce_target": target_canonical,
+            "workforce_fallback": False,
+            "workforce_mix": {},
+        }
+        if cohort.empty:
+            out = cohort.copy()
+            out.attrs = meta
+            return out
+        if "EmployeeType" not in cohort.columns:
+            out = cohort.copy()
+            out.attrs = meta
+            return out
+        mix = {str(k): int(v) for k, v in cohort["EmployeeType"].value_counts().items()}
+        meta["workforce_mix"] = mix
+        strict = cohort[cohort["EmployeeType"] == target_canonical].copy()
+        if len(strict) >= self.MIN_COHORT_SIZE:
+            strict.attrs = {**meta, "workforce_fallback": False}
+            return strict
+        if strict.empty:
+            out = cohort.copy()
+            out.attrs = {**meta, "workforce_fallback": True}
+            return out
+        out = cohort.copy()
+        out.attrs = {**meta, "workforce_fallback": True}
+        return out
+
     def _select_ad_comparison_cohort(
         self,
         users_df: pd.DataFrame,
@@ -756,6 +837,7 @@ class AccessRecommendationEngine:
 
         title_clean = self._normalize_role_text(title)
         department_clean = self._normalize_role_text(department)
+        target_canonical = canonical_from_ui_label(employee_type)
 
         reference_group_names: set = set()
         if not reference_recs.empty and "GroupNameClean" in reference_recs.columns:
@@ -768,10 +850,13 @@ class AccessRecommendationEngine:
             (users["TitleClean"] == title_clean)
             & (users["DepartmentClean"] == department_clean)
         ].copy()
-        if len(exact_cohort) >= self.MIN_COHORT_SIZE:
-            return self._refine_by_reference_overlap(
-                exact_cohort, reference_group_names, title_clean
+        exact_workforce = self._cohort_with_workforce(exact_cohort, target_canonical)
+        if len(exact_workforce) >= self.MIN_COHORT_SIZE:
+            refined = self._refine_by_reference_overlap(
+                exact_workforce, reference_group_names, title_clean
             )
+            refined.attrs = getattr(exact_workforce, "attrs", {}).copy()
+            return refined
 
         # Level 2: department-only (copy-from fallback when dept not found)
         same_department = users[users["DepartmentClean"] == department_clean].copy()
@@ -781,22 +866,35 @@ class AccessRecommendationEngine:
                 copy_dept_clean = copy_user.iloc[0]["DepartmentClean"]
                 same_department = users[users["DepartmentClean"] == copy_dept_clean].copy()
 
+        dept_workforce = self._cohort_with_workforce(same_department, target_canonical)
         refined_same_department = self._refine_by_reference_overlap(
-            same_department, reference_group_names, title_clean
+            dept_workforce, reference_group_names, title_clean
         )
         if len(same_department) >= self.MIN_COHORT_SIZE or len(refined_same_department) >= 3:
+            refined_same_department.attrs = getattr(dept_workforce, "attrs", {}).copy()
             return refined_same_department
 
         # Level 3: title cross-department
         cross_dept = users[users["TitleClean"] == title_clean].copy()
-        if len(cross_dept) >= self.MIN_COHORT_SIZE:
-            return cross_dept
+        cross_workforce = self._cohort_with_workforce(cross_dept, target_canonical)
+        if len(cross_workforce) >= self.MIN_COHORT_SIZE:
+            refined_cross = self._refine_by_reference_overlap(
+                cross_workforce, reference_group_names, title_clean
+            )
+            refined_cross.attrs = getattr(cross_workforce, "attrs", {}).copy()
+            return refined_cross
 
         # Level 4: return the largest non-empty candidate we found
-        candidates = [c for c in [exact_cohort, same_department, cross_dept] if not c.empty]
+        wf_exact = self._cohort_with_workforce(exact_cohort, target_canonical)
+        wf_dept = self._cohort_with_workforce(same_department, target_canonical)
+        wf_cross = self._cohort_with_workforce(cross_dept, target_canonical)
+        candidates = [c for c in [wf_exact, wf_dept, wf_cross] if not c.empty]
         if candidates:
-            return max(candidates, key=len)
-        return exact_cohort  # empty DataFrame
+            best = max(candidates, key=len)
+            return best
+        out = exact_cohort.copy()
+        out.attrs = getattr(wf_exact, "attrs", {}).copy()
+        return out
 
     def _compute_global_group_rates(self, users: pd.DataFrame) -> dict[str, float]:
         if users.empty:
@@ -859,7 +957,8 @@ class AccessRecommendationEngine:
 
     @classmethod
     def _normalize_group_name(cls, value) -> str:
-        text = str(value).lower().strip()
+        base = normalize_single_permission(value)
+        text = str(base).lower().strip() if base else ""
 
         for prefix in ("m.", "i.", "dce.", "dce-", "dce "):
             if text.startswith(prefix):

@@ -6,13 +6,15 @@ import warnings
 
 import pandas as pd
 
-from DataLayer.loader import DataLoader
 from DataLayer.access_exclusions import (
     count_excluded_reference_rows,
     filter_reference_df,
     is_excluded_access,
     is_excluded_access_category,
 )
+from DataLayer.loader import DataLoader
+from DataLayer.permission_normalization import normalize_single_permission
+from DataLayer.workforce_type import canonical_from_reference_employee_type
 
 
 class RightsSheetsLoader:
@@ -20,6 +22,7 @@ class RightsSheetsLoader:
 
     OUTPUT_COLUMNS = [
         "EmployeeType",
+        "EmployeeTypeCanonical",
         "JobTitle",
         "Department",
         "Supervisor",
@@ -413,13 +416,14 @@ class RightsSheetsLoader:
         access_name: str,
         source_file: str,
     ) -> dict:
+        access_norm = normalize_single_permission(access_name) or ""
         return {
             "EmployeeType": employee_type,
             "JobTitle": job_title,
             "Department": department,
             "Supervisor": supervisor,
             "AccessCategory": access_category,
-            "AccessName": access_name,
+            "AccessName": access_norm,
             "SourceFile": source_file,
         }
 
@@ -433,8 +437,14 @@ class RightsSheetsLoader:
             return df
 
         for col in self.OUTPUT_COLUMNS:
+            if col == "EmployeeTypeCanonical":
+                df[col] = df["EmployeeType"].apply(canonical_from_reference_employee_type)
+                continue
             df[col] = df[col].apply(self._clean_optional_text)
-        df = df[df["AccessName"].fillna("").str.strip() != ""].copy()
+        df["AccessName"] = df["AccessName"].apply(
+            lambda v: normalize_single_permission(v) or ""
+        )
+        df = df[df["AccessName"].str.strip() != ""].copy()
         df = df.drop_duplicates().reset_index(drop=True)
         return df
 
@@ -455,7 +465,9 @@ class RightsSheetsLoader:
                     continue
                 if self._is_likely_person_entry(token):
                     continue
-                cleaned.append(token)
+                norm = normalize_single_permission(token)
+                if norm:
+                    cleaned.append(norm)
         return cleaned
 
     @classmethod

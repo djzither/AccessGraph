@@ -77,13 +77,32 @@ class MLRecommender:
 
         return pool
 
+    def _restrict_workforce(
+        self,
+        pool: pd.DataFrame,
+        workforce_segment: str | None,
+    ) -> tuple[pd.DataFrame, bool]:
+        if (
+            workforce_segment is None
+            or pool.empty
+            or "EmployeeType" not in pool.columns
+        ):
+            return pool.copy(), False
+        strict = pool[pool["EmployeeType"] == workforce_segment].copy()
+        if len(strict) >= self.MIN_POOL_SIZE:
+            return strict, False
+        if strict.empty:
+            return pool.copy(), True
+        return pool.copy(), True
+
     def _similarity_pool_for_user(
         self,
         *,
         title: str,
         department: str,
         include_supervisors: bool = False,
-    ) -> pd.DataFrame:
+        workforce_segment: str | None = None,
+    ) -> tuple[pd.DataFrame, bool]:
         # Fallback order (preserves MIN_POOL_SIZE behavior):
         # 1) Exact normalized Title + Department cohort (most role-aware)
         # 2) Department-only cohort (current behavior)
@@ -93,22 +112,26 @@ class MLRecommender:
             department=department,
             include_supervisors=include_supervisors,
         )
+        role_pool, wf_fb = self._restrict_workforce(role_pool, workforce_segment)
         if len(role_pool) >= self.MIN_POOL_SIZE:
-            return role_pool
+            return role_pool, wf_fb
 
         dept_pool = self._same_department_pool(
             department=department,
             include_supervisors=include_supervisors,
             allow_global_fallback=False,
         )
+        dept_pool, wf_fb2 = self._restrict_workforce(dept_pool, workforce_segment)
+        wf_fb = wf_fb or wf_fb2
         if len(dept_pool) >= self.MIN_POOL_SIZE:
-            return dept_pool
+            return dept_pool, wf_fb
 
         # Final fallback: preserve existing behavior by using the full dataset.
         pool = self.users_df.copy()
         if not include_supervisors and "IsSupervisor" in pool.columns:
             pool = pool[pool["IsSupervisor"] == False]
-        return pool
+        pool, wf_fb3 = self._restrict_workforce(pool, workforce_segment)
+        return pool, wf_fb or wf_fb3
 
     def recommend_for_user(
         self,
@@ -117,6 +140,7 @@ class MLRecommender:
         top_n_users: int = 5,
         min_support: int = 3,
         include_supervisors: bool = False,
+        workforce_segment: str | None = None,
     ) -> pd.DataFrame:
         target_user = self.users_df[
             self.users_df["SamAccountName"] == sam_account_name
@@ -137,10 +161,11 @@ class MLRecommender:
             if "Department" in target_user.columns and len(target_user["Department"]) > 0
             else department
         )
-        pool = self._similarity_pool_for_user(
+        pool, pool_wf_fallback = self._similarity_pool_for_user(
             title=target_title,
             department=target_department,
             include_supervisors=include_supervisors,
+            workforce_segment=workforce_segment,
         )
 
         pool = pd.concat([pool, target_user], ignore_index=True)
@@ -184,10 +209,12 @@ class MLRecommender:
         if not rows:
             return pd.DataFrame()
 
-        return filter_recommendations_df(pd.DataFrame(rows)).sort_values(
+        out = filter_recommendations_df(pd.DataFrame(rows)).sort_values(
             ["MLConfidence", "MLSupportCount"],
             ascending=False,
         )
+        out["MLWorkforcePoolFallback"] = pool_wf_fallback
+        return out
 
     def recommend_for_role_peers(
         self,
@@ -253,12 +280,21 @@ class MLRecommender:
         self,
         cohort_df: pd.DataFrame,
         min_support: int = 2,
+        workforce_segment: str | None = None,
+        peer_aggregate_fallback: bool = False,
     ) -> pd.DataFrame:
 
         if cohort_df.empty:
             return pd.DataFrame()
 
         role_peers = filter_user_groups_df(cohort_df)
+        ml_wf_fb = bool(peer_aggregate_fallback)
+        if workforce_segment is not None and "EmployeeType" in role_peers.columns:
+            strict = role_peers[role_peers["EmployeeType"] == workforce_segment].copy()
+            if len(strict) >= 2:
+                role_peers = strict
+            elif len(strict) < len(role_peers):
+                ml_wf_fb = True
 
         if "SamAccountName" in role_peers.columns:
             role_peers = role_peers.sort_values("SamAccountName")
@@ -288,7 +324,9 @@ class MLRecommender:
         if not rows:
             return pd.DataFrame()
 
-        return filter_recommendations_df(pd.DataFrame(rows)).sort_values(
+        out = filter_recommendations_df(pd.DataFrame(rows)).sort_values(
             ["MLConfidence", "MLSupportCount"],
             ascending=False,
         )
+        out["MLWorkforcePoolFallback"] = ml_wf_fb
+        return out
