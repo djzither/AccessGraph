@@ -8,6 +8,8 @@ from DataLayer.access_exclusions import (
     filter_reference_df,
     filter_user_groups_df,
 )
+from DataLayer.subgroup_detection import analyze_recommendation_subgroups
+from DeterministicLayer.access_pattern_labels import apply_access_pattern_columns
 from DeterministicLayer.permission_filter import PermissionFilter
 from DeterministicLayer.permission_matrix import PermissionMatrixBuilder
 from DeterministicLayer.title_embed_matcher import TitleEmbedMatcher
@@ -119,6 +121,12 @@ class AccessRecommendationEngine:
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
         merged["Reason"] = self._build_reason_series(merged)
+
+        sub_df = analyze_recommendation_subgroups(
+            comparison_cohort=comparison_cohort,
+            recommendations_df=merged,
+        )
+        merged = apply_access_pattern_columns(merged, sub_df)
 
         merged = filter_recommendations_df(merged)
 

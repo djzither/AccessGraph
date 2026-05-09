@@ -12,6 +12,7 @@ import streamlit as st
 from DataLayer.access_exclusions import filter_reference_df, filter_recommendations_df, filter_user_groups_df
 from DataLayer.cleaner import DataCleaner
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
+from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_analyzer import AccessPatternAnalyzer
 from DeterministicLayer.privilege_audit import PrivilegeAuditAnalyzer
 from ProductLayer.AccessRecommendationEngine import AccessRecommendationEngine
@@ -150,6 +151,12 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
                 key="ob_conf",
             )
 
+    show_subgroup_diagnostics = st.checkbox(
+        "Show subgroup diagnostics (explainability only; does not change scores)",
+        value=False,
+        key="ob_subgroup",
+    )
+
     # Cohort preview before running
     cohort_size = len(
         users_for_recs[
@@ -205,9 +212,10 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
 
     # ── Results table ─────────────────────────────────────────────────────────
     display_cols = [
-        "GroupName", "FinalDecision", "FinalScore", "RiskLevel",
+        "GroupName", "AccessPattern", "FinalDecision", "FinalScore", "RiskLevel",
         "InReferenceSheet", "ADConfidence", "MLConfidence",
-        "UserCountWithGroup", "TotalUsersInRole", "Reason",
+        "UserCountWithGroup", "TotalUsersInRole",
+        "AmbiguityReason", "ReviewQuestion", "Reason",
     ]
     display_cols = [c for c in display_cols if c in recs.columns]
     display = recs[display_cols].copy()
@@ -224,6 +232,7 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
 
     display = display.rename(columns={
         "GroupName":          "Permission",
+        "AccessPattern":      "Access pattern",
         "FinalDecision":      "Decision",
         "FinalScore":         "Score",
         "RiskLevel":          "Risk",
@@ -232,9 +241,113 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
         "MLConfidence":       "ML Conf",
         "UserCountWithGroup": "Users With",
         "TotalUsersInRole":   "Role Total",
+        "AmbiguityReason":    "Why this label",
+        "ReviewQuestion":     "Review question",
     })
 
     st.dataframe(display, use_container_width=True, hide_index=True)
+
+    # Subgroup diagnostics: explainability only (same cohort selection as AD peer counts).
+    if show_subgroup_diagnostics:
+        sub_df = pd.DataFrame()
+        cohort_size = 0
+        with st.spinner("Computing subgroup diagnostics (engine AD cohort)…"):
+            try:
+                reference_recs = engine._get_reference_recommendations(
+                    reference_df=ref,
+                    title=title,
+                    department=department,
+                    employee_type=employee_type,
+                    supervisor=supervisor or None,
+                    users_df=users_for_recs,
+                    copy_from_netid=copy_from or None,
+                )
+                comparison_cohort = engine._select_ad_comparison_cohort(
+                    users_df=users_for_recs,
+                    title=title,
+                    department=department,
+                    reference_recs=reference_recs,
+                    employee_type=employee_type,
+                    copy_from_netid=copy_from or None,
+                )
+                cohort_size = len(comparison_cohort)
+                sub_df = analyze_recommendation_subgroups(
+                    comparison_cohort=comparison_cohort,
+                    recommendations_df=recs,
+                )
+            except Exception as exc:
+                st.warning(f"Subgroup diagnostics unavailable: {exc}")
+
+        if not sub_df.empty:
+            subgroup_by_perm = {
+                str(row["permission"]): row
+                for _, row in sub_df.iterrows()
+            }
+            st.divider()
+            st.markdown("#### Subgroup diagnostics")
+            st.caption(
+                f"Explainability only — engine-selected AD comparison cohort "
+                f"**({cohort_size} users)**. Does **not** change scores or decisions."
+            )
+            for _, rrow in recs.iterrows():
+                gname = str(rrow["GroupName"])
+                if gname not in subgroup_by_perm:
+                    continue
+                diag = subgroup_by_perm[gname]
+                assessment = str(diag.get("subgroup_assessment", "Rare Access"))
+                specialized = assessment == "Subrole Access"
+                with_users = diag.get("users_with_permission") or []
+                without_users = diag.get("users_without_permission") or []
+                with_shared = diag.get("with_shared_permissions") or []
+                without_shared = diag.get("without_shared_permissions") or []
+                indicators = diag.get("strongest_subgroup_indicators") or []
+
+                label = f"{gname} — {assessment}"
+                with st.expander(label, expanded=False):
+                    st.markdown(
+                        "**Specialized subgroup (permission pattern):** "
+                        + (
+                            "Yes — holders share other permissions at high rate vs non-holders "
+                            "(suggests a functional sub-slice)."
+                            if specialized
+                            else "No — pattern fits rare or broad cohort access (no strong subrole lift)."
+                        )
+                    )
+                    st.markdown(f"**Subgroup assessment:** `{assessment}`")
+                    c1, c2 = st.columns(2)
+                    with c1:
+                        st.markdown(
+                            f"**Users with this permission:** {len(with_users)} "
+                            f"— `{', '.join(with_users)}`"
+                            if with_users
+                            else "**Users with this permission:** 0"
+                        )
+                    with c2:
+                        st.markdown(
+                            f"**Users without:** {len(without_users)} "
+                            f"— `{', '.join(without_users)}`"
+                            if without_users
+                            else "**Users without:** 0"
+                        )
+                    st.markdown("**Shared permissions among holders** (high support within “with” slice):")
+                    if with_shared:
+                        st.markdown("\n".join(f"- `{p}`" for p in with_shared))
+                    else:
+                        st.caption("None above default frequency threshold.")
+                    st.markdown("**Contrast — commonly shared by users without this permission:**")
+                    if without_shared:
+                        st.markdown("\n".join(f"- `{p}`" for p in without_shared))
+                    else:
+                        st.caption("None above default frequency threshold.")
+                    st.markdown("**Strongest subgroup indicators** (lift = rate_with − rate_without):")
+                    if indicators:
+                        st.dataframe(
+                            pd.DataFrame(indicators),
+                            use_container_width=True,
+                            hide_index=True,
+                        )
+                    else:
+                        st.caption("No indicators passed default lift/support thresholds.")
 
 
 # ---------------------------------------------------------------------------
