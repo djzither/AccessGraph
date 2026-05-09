@@ -4,6 +4,10 @@ from MLLayer.similarity_model import SimilarityModel
 
 
 class MLRecommender:
+    # Fall back to the full user dataset when a department pool is smaller
+    # than this — a tiny pool produces unreliable cosine similarities.
+    MIN_POOL_SIZE = 10
+
     def __init__(self, users_df: pd.DataFrame):
         self.users_df = users_df.copy()
 
@@ -25,6 +29,13 @@ class MLRecommender:
 
         if not include_supervisors and "IsSupervisor" in pool.columns:
             pool = pool[pool["IsSupervisor"] == False]
+
+        # If the department is too small for a meaningful similarity search,
+        # widen to the full dataset so the model has enough variance to work with.
+        if len(pool) < self.MIN_POOL_SIZE:
+            pool = self.users_df.copy()
+            if not include_supervisors and "IsSupervisor" in pool.columns:
+                pool = pool[pool["IsSupervisor"] == False]
 
         return pool
 

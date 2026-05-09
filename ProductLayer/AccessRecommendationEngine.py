@@ -9,6 +9,11 @@ from MLLayer.recommender import MLRecommender
 
 
 class AccessRecommendationEngine:
+    # Minimum cohort sizes for reliable frequency signals.
+    MIN_COHORT_SIZE = 5       # below this we widen the cohort
+    MIN_RELIABLE_COHORT = 10  # below this we down-weight AD/ML and up-weight reference
+    AD_SMOOTHING_FACTOR = 5   # Laplace pseudo-count added to denominator
+
     ROLE_ALIASES = {
         (
             "academic outreach and sales rep",
@@ -231,14 +236,18 @@ class AccessRecommendationEngine:
         rows = []
 
         for group_name, count in counter.items():
-            confidence = round(count / total_users, 3)
+            # Laplace smoothing: add AD_SMOOTHING_FACTOR pseudo-observations so
+            # a group seen by 2/3 users in a tiny cohort doesn't score 0.67 — it
+            # scores 2/(3+5)=0.25, which better reflects how unreliable that is.
+            smoothed = round(count / (total_users + self.AD_SMOOTHING_FACTOR), 3)
 
-            if confidence < self.matrix_builder.min_confidence:
+            if smoothed < self.matrix_builder.min_confidence:
                 continue
 
             rows.append({
                 "GroupName": group_name,
-                "ADConfidence": confidence,
+                "ADConfidence": smoothed,
+                "ADRawConfidence": round(count / total_users, 3),
                 "UserCountWithGroup": count,
                 "TotalUsersInRole": total_users,
             })
@@ -448,6 +457,14 @@ class AccessRecommendationEngine:
             ml_weights = (0.10, 0.05, 0.03)
             copy_weight = 0.05
 
+        # Scale AD/ML weight by cohort reliability; boost reference when cohort is small.
+        cohort_size = int(row.get("TotalUsersInRole", 0))
+        cohort_factor = min(1.0, cohort_size / self.MIN_RELIABLE_COHORT)
+        ad_weights = tuple(w * cohort_factor for w in ad_weights)
+        ml_weights = tuple(w * cohort_factor for w in ml_weights)
+        if cohort_factor < 1.0 and not is_fsy_role:
+            reference_weight = min(0.80, reference_weight + (1 - cohort_factor) * 0.20)
+
         if row["InReferenceSheet"]:
             score += reference_weight
 
@@ -533,72 +550,94 @@ class AccessRecommendationEngine:
         employee_type: str,
         copy_from_netid: str | None = None,
     ) -> pd.DataFrame:
-        users = users_df.copy()
+        """
+        Build the best comparison cohort using a 4-level fallback strategy.
 
+        Level 1 — exact (title + dept): most precise; used when ≥ MIN_COHORT_SIZE.
+        Level 2 — dept-only (+ copy-from fallback): wider pool; used when ≥ MIN_COHORT_SIZE.
+        Level 3 — title cross-dept: catches titles that span departments.
+        Level 4 — largest non-empty candidate: last resort to avoid empty cohort.
+
+        Each level that clears the size bar is further refined by reference-sheet
+        overlap so that users who "look like" this role float to the top.
+        """
+        users = users_df.copy()
         users["TitleClean"] = users["Title"].apply(self._normalize_role_text)
         users["DepartmentClean"] = users["Department"].apply(self._normalize_role_text)
 
         title_clean = self._normalize_role_text(title)
         department_clean = self._normalize_role_text(department)
 
-        same_department = users[users["DepartmentClean"] == department_clean].copy()
-
-        if same_department.empty:
-            # Full-time requests can come from a reference sheet title/department
-            # that does not exactly match AD naming. If a copy-from user is given,
-            # use that user's AD department as the cohort anchor.
-            if str(employee_type).lower().strip() == "full time" and copy_from_netid is not None:
-                copy_user = users[users["SamAccountName"] == copy_from_netid]
-                if not copy_user.empty:
-                    copy_department_clean = copy_user.iloc[0]["DepartmentClean"]
-                    fallback_department = users[
-                        users["DepartmentClean"] == copy_department_clean
-                    ].copy()
-                    if not fallback_department.empty:
-                        same_department = fallback_department
-
-        if same_department.empty:
-            return users[
-                (users["TitleClean"] == title_clean)
-                & (users["DepartmentClean"] == department_clean)
-            ].copy()
-
-        reference_group_names = set()
-
+        reference_group_names: set = set()
         if not reference_recs.empty and "GroupNameClean" in reference_recs.columns:
             reference_group_names = set(
                 reference_recs["GroupNameClean"].dropna().astype(str)
             )
 
-        if reference_group_names:
-            same_department["ReferenceOverlapCount"] = same_department["GroupsList"].apply(
-                lambda groups: sum(
-                    1
-                    for group in groups
-                    if self._normalize_group_name(group) in reference_group_names
-                )
+        # Level 1: exact title + department
+        exact_cohort = users[
+            (users["TitleClean"] == title_clean)
+            & (users["DepartmentClean"] == department_clean)
+        ].copy()
+        if len(exact_cohort) >= self.MIN_COHORT_SIZE:
+            return self._refine_by_reference_overlap(
+                exact_cohort, reference_group_names, title_clean
             )
 
-            overlap_cohort = same_department[
-                same_department["ReferenceOverlapCount"] >= 2
-            ].copy()
+        # Level 2: department-only (copy-from fallback when dept not found)
+        same_department = users[users["DepartmentClean"] == department_clean].copy()
+        if same_department.empty and str(employee_type).lower().strip() == "full time" and copy_from_netid is not None:
+            copy_user = users[users["SamAccountName"] == copy_from_netid]
+            if not copy_user.empty:
+                copy_dept_clean = copy_user.iloc[0]["DepartmentClean"]
+                same_department = users[users["DepartmentClean"] == copy_dept_clean].copy()
 
-            if overlap_cohort.empty:
-                overlap_cohort = same_department[
-                    same_department["ReferenceOverlapCount"] >= 1
-                ].copy()
+        if len(same_department) >= self.MIN_COHORT_SIZE:
+            return self._refine_by_reference_overlap(
+                same_department, reference_group_names, title_clean
+            )
 
-            if not overlap_cohort.empty:
-                return overlap_cohort
+        # Level 3: title cross-department
+        cross_dept = users[users["TitleClean"] == title_clean].copy()
+        if len(cross_dept) >= self.MIN_COHORT_SIZE:
+            return cross_dept
 
-        exact_title_cohort = same_department[
-            same_department["TitleClean"] == title_clean
-        ].copy()
+        # Level 4: return the largest non-empty candidate we found
+        candidates = [c for c in [exact_cohort, same_department, cross_dept] if not c.empty]
+        if candidates:
+            return max(candidates, key=len)
+        return exact_cohort  # empty DataFrame
 
-        if not exact_title_cohort.empty:
-            return exact_title_cohort
+    def _refine_by_reference_overlap(
+        self,
+        cohort: pd.DataFrame,
+        reference_group_names: set,
+        title_clean: str,
+    ) -> pd.DataFrame:
+        """
+        Within a cohort, prefer users whose current access overlaps the
+        reference sheet — they are most similar to the target role.
+        Falls back gracefully when no overlap is found.
+        """
+        if reference_group_names:
+            cohort = cohort.copy()
+            cohort["_overlap"] = cohort["GroupsList"].apply(
+                lambda groups: sum(
+                    1 for g in groups
+                    if self._normalize_group_name(g) in reference_group_names
+                )
+            )
+            for min_overlap in (2, 1):
+                refined = cohort[cohort["_overlap"] >= min_overlap].drop(columns=["_overlap"])
+                if not refined.empty:
+                    return refined
+            cohort = cohort.drop(columns=["_overlap"])
 
-        return same_department
+        # No reference signal — fall back to exact title match, then full cohort
+        exact = cohort[cohort["TitleClean"] == title_clean] if "TitleClean" in cohort.columns else pd.DataFrame()
+        if not exact.empty:
+            return exact
+        return cohort
 
     @classmethod
     def _normalize_role_text(cls, value) -> str:
