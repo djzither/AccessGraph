@@ -1,5 +1,7 @@
 import pandas as pd
 
+from DataLayer.access_exclusions import filter_group_list, filter_user_groups_df
+
 
 class PrivilegeAuditAnalyzer:
     """
@@ -21,7 +23,7 @@ class PrivilegeAuditAnalyzer:
           - IsOverprivileged     : True when ratio >= threshold_multiplier
           - ExtraGroupCount      : groups above the role median (floored at 0)
         """
-        df = users_df.copy()
+        df = filter_user_groups_df(users_df)
         df["GroupCount"] = df["GroupsList"].apply(len)
 
         role_stats = (
@@ -67,7 +69,7 @@ class PrivilegeAuditAnalyzer:
 
     def get_role_summary(self, users_df: pd.DataFrame) -> pd.DataFrame:
         """Per-(Title, Department) group-count statistics."""
-        df = users_df.copy()
+        df = filter_user_groups_df(users_df)
         df["GroupCount"] = df["GroupsList"].apply(len)
 
         return (

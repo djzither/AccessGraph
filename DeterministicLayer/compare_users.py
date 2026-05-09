@@ -1,12 +1,14 @@
 import pandas as pd
 
+from DataLayer.access_exclusions import filter_group_list
+
 class UserComparer:
     def get_user_groupes(self, df: pd.DataFrame, sam_account_name: str) -> set:
         user = df[df["SamAccountName"] == sam_account_name]
 
         if user.empty:
             raise ValueError(f"User {sam_account_name} does not exist")
-        return set(user.iloc[0]["GroupsList"])
+        return set(filter_group_list(user.iloc[0]["GroupsList"]))
 
 
     def compare(self, df: pd.DataFrame, user_a: str, user_b: str) -> dict:

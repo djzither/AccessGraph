@@ -2,10 +2,12 @@ import pandas as pd
 from sklearn.metrics.pairwise import cosine_similarity
 import numpy as np
 
+from DataLayer.access_exclusions import filter_user_groups_df
+
 
 class SimilarityModel:
     def fit(self, users_df: pd.DataFrame):
-        self.users_df = users_df.copy().reset_index(drop=True)
+        self.users_df = filter_user_groups_df(users_df).reset_index(drop=True)
 
         all_users = self.users_df["SamAccountName"].astype(str).unique()
 

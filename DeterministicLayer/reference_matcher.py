@@ -1,9 +1,11 @@
 import pandas as pd
 
+from DataLayer.access_exclusions import filter_recommendations_df, filter_reference_df
+
 
 class ReferenceMatcher:
     def __init__(self, reference_df: pd.DataFrame):
-        self.reference_df = reference_df.copy()
+        self.reference_df = filter_reference_df(reference_df)
 
         self.reference_df["AccessNameClean"] = (
             self.reference_df["AccessName"].astype(str).str.lower().str.strip()
@@ -33,7 +35,7 @@ class ReferenceMatcher:
         employee_type: str | None = None,
         supervisor: str | None = None,
     ) -> pd.DataFrame:
-        recommendations = recommendations.copy()
+        recommendations = filter_recommendations_df(recommendations)
 
         title_clean = str(title).lower().strip()
         department_clean = str(department).lower().strip()

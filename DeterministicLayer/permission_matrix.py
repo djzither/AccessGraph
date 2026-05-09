@@ -1,6 +1,8 @@
 import pandas as pd
 from collections import Counter
 
+from DataLayer.access_exclusions import filter_group_list, filter_recommendations_df
+
 
 class PermissionMatrixBuilder:
     def __init__(self, min_confidence: float = 0.5):
@@ -15,7 +17,7 @@ class PermissionMatrixBuilder:
             counter = Counter()
 
             for groups in group["GroupsList"]:
-                counter.update(groups)
+                counter.update(filter_group_list(groups))
 
             for group_name, count in counter.items():
                 confidence = count / total_users
@@ -34,6 +36,8 @@ class PermissionMatrixBuilder:
         if matrix.empty:
             return matrix
 
+        matrix = filter_recommendations_df(matrix)
+
         return matrix.sort_values(
             by=["Title", "Department", "Confidence"],
             ascending=[True, True, False],
@@ -51,4 +55,5 @@ class PermissionMatrixBuilder:
             (matrix["Confidence"] >= self.min_confidence)
         ].copy()
 
+        matches = filter_recommendations_df(matches)
         return matches.sort_values(by="Confidence", ascending=False)

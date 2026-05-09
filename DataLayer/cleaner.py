@@ -3,6 +3,8 @@ import re
 import shutil
 import pandas as pd
 
+from DataLayer.access_exclusions import is_excluded_permission
+
 
 class DataCleaner:
     AD_GROUP_PREFIX_PATTERN = re.compile(r"^[A-Za-z]\.")
@@ -26,6 +28,7 @@ class DataCleaner:
                 and not g.startswith("Cannot find an object")
                 and "Cannot find an object with identity" not in g
                 and not self.AD_GROUP_PREFIX_PATTERN.match(g)
+                and not is_excluded_permission(g)
             ]
 
             return cleaned

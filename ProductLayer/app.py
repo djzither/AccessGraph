@@ -9,6 +9,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import pandas as pd
 import streamlit as st
 
+from DataLayer.access_exclusions import filter_reference_df, filter_recommendations_df, filter_user_groups_df
 from DataLayer.cleaner import DataCleaner
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
 from DeterministicLayer.access_pattern_analyzer import AccessPatternAnalyzer
@@ -45,14 +46,14 @@ EXCLUDED_FSY_TITLES = {
 @st.cache_data
 def load_users(clean_data_path: str, data_mtime: float) -> pd.DataFrame:
     cleaner = DataCleaner(processed_path=clean_data_path)
-    return cleaner.load_cleaned()
+    return filter_user_groups_df(cleaner.load_cleaned())
 
 
 @st.cache_data
 def load_reference(raw_data_path: str) -> pd.DataFrame:
     try:
         loader = RightsSheetsLoader(raw_path=raw_data_path)
-        return loader.load_reference_sheets()
+        return filter_reference_df(loader.load_reference_sheets())
     except Exception:
         return pd.DataFrame()
 
@@ -184,6 +185,11 @@ def render_onboarding_tab(users_df: pd.DataFrame, reference_df: pd.DataFrame) ->
             st.error(f"Engine error: {exc}")
             return
 
+    if recs.empty:
+        st.warning("No recommendations found for this role combination.")
+        return
+
+    recs = filter_recommendations_df(recs)
     if recs.empty:
         st.warning("No recommendations found for this role combination.")
         return

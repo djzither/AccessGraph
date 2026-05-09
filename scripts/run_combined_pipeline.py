@@ -1,6 +1,7 @@
 from pathlib import Path
 import pandas as pd
 
+from DataLayer.access_exclusions import filter_group_list, filter_recommendations_df, filter_user_groups_df
 from DeterministicLayer.rules_recommender import RulesRecommender
 from MLLayer.recommender import MLRecommender
 
@@ -27,7 +28,7 @@ def add_user_evidence_columns(
     users: pd.DataFrame,
     target_user: str,
 ) -> pd.DataFrame:
-    final_results = final_results.copy()
+    final_results = filter_recommendations_df(final_results)
 
     users_by_id = users.set_index("SamAccountName")
 
@@ -47,7 +48,7 @@ def add_user_evidence_columns(
                 final_results.loc[idx, f"Has_{user}"] = False
                 continue
 
-            rights = set(users_by_id.loc[user, "GroupsList"])
+            rights = set(filter_group_list(users_by_id.loc[user, "GroupsList"]))
             has_group = group in rights
 
             final_results.loc[idx, f"Has_{user}"] = has_group
@@ -55,7 +56,7 @@ def add_user_evidence_columns(
             if has_group:
                 holders.append(user)
 
-        target_rights = set(users_by_id.loc[target_user, "GroupsList"])
+        target_rights = set(filter_group_list(users_by_id.loc[target_user, "GroupsList"]))
 
         final_results.loc[idx, "TargetAlreadyHas"] = group in target_rights
         final_results.loc[idx, "UsersWithThisRight"] = ", ".join(holders)
@@ -210,7 +211,7 @@ def main():
         print("Could not find clean_users.parquet.")
         return
 
-    users = pd.read_parquet(DATA_PATH)
+    users = filter_user_groups_df(pd.read_parquet(DATA_PATH))
     users = add_supervisor_flag(users)
 
     print(f"Loaded users: {len(users)}")
@@ -245,7 +246,7 @@ def main():
     print(f"Title: {title}")
     print(f"Department: {department}")
 
-    target_rights = set(target_user.iloc[0]["GroupsList"])
+    target_rights = set(filter_group_list(target_user.iloc[0]["GroupsList"]))
 
     # -----------------------------
     # Deterministic
@@ -304,10 +305,10 @@ def main():
     # -----------------------------
     # Combine
     # -----------------------------
-    final_results = combine_recommendations(
+    final_results = filter_recommendations_df(combine_recommendations(
         deterministic_results=deterministic_results,
         ml_results=ml_results,
-    )
+    ))
 
     final_results = add_user_evidence_columns(
         final_results=final_results,

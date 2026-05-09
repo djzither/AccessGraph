@@ -1,5 +1,6 @@
 import pandas as pd
 
+from DataLayer.access_exclusions import filter_recommendations_df, filter_user_groups_df
 from DeterministicLayer.rules_recommender import RulesRecommender
 from MLLayer.recommender import MLRecommender
 
@@ -21,6 +22,8 @@ class HybridRecommender:
         include_supervisors: bool = False,
     ) -> pd.DataFrame:
 
+        users_df = filter_user_groups_df(users_df)
+
         rules_results = self.rules_recommender.recommend_for_new_user(
             users_df=users_df,
             title=title,
@@ -35,7 +38,7 @@ class HybridRecommender:
             include_supervisors=include_supervisors,
         )
 
-        final = self._combine_results(rules_results, ml_results)
+        final = filter_recommendations_df(self._combine_results(rules_results, ml_results))
         final = self._assign_final_decisions(final)
 
         return final.sort_values(

@@ -1,5 +1,6 @@
 import pandas as pd
 
+from DataLayer.access_exclusions import filter_group_list, filter_recommendations_df, filter_user_groups_df
 from MLLayer.similarity_model import SimilarityModel
 
 
@@ -9,7 +10,7 @@ class MLRecommender:
     MIN_POOL_SIZE = 10
 
     def __init__(self, users_df: pd.DataFrame):
-        self.users_df = users_df.copy()
+        self.users_df = filter_user_groups_df(users_df)
 
     def _same_department_pool(
         self,
@@ -75,14 +76,12 @@ class MLRecommender:
 
         users_by_id = pool.set_index("SamAccountName")
 
-        target_rights = set(
-            users_by_id.loc[sam_account_name, "GroupsList"]
-        )
+        target_rights = set(filter_group_list(users_by_id.loc[sam_account_name, "GroupsList"]))
 
         candidate_counts = {}
 
         for similar_user in similar_users["SamAccountName"]:
-            rights = users_by_id.loc[similar_user, "GroupsList"]
+            rights = filter_group_list(users_by_id.loc[similar_user, "GroupsList"])
 
             for right in rights:
                 if right not in target_rights:
@@ -103,7 +102,7 @@ class MLRecommender:
         if not rows:
             return pd.DataFrame()
 
-        return pd.DataFrame(rows).sort_values(
+        return filter_recommendations_df(pd.DataFrame(rows)).sort_values(
             ["MLConfidence", "MLSupportCount"],
             ascending=False,
         )
@@ -144,7 +143,7 @@ class MLRecommender:
         candidate_counts = {}
 
         for rights in role_peers["GroupsList"]:
-            for right in rights:
+            for right in filter_group_list(rights):
                 candidate_counts[right] = candidate_counts.get(right, 0) + 1
 
         rows = []
@@ -163,7 +162,7 @@ class MLRecommender:
         if not rows:
             return pd.DataFrame()
 
-        return pd.DataFrame(rows).sort_values(
+        return filter_recommendations_df(pd.DataFrame(rows)).sort_values(
             ["MLConfidence", "MLSupportCount"],
             ascending=False,
         )
@@ -177,7 +176,7 @@ class MLRecommender:
         if cohort_df.empty:
             return pd.DataFrame()
 
-        role_peers = cohort_df.copy()
+        role_peers = filter_user_groups_df(cohort_df)
 
         if "SamAccountName" in role_peers.columns:
             role_peers = role_peers.sort_values("SamAccountName")
@@ -188,7 +187,7 @@ class MLRecommender:
         candidate_counts = {}
 
         for rights in role_peers["GroupsList"]:
-            for right in rights:
+            for right in filter_group_list(rights):
                 candidate_counts[right] = candidate_counts.get(right, 0) + 1
 
         rows = []
@@ -207,7 +206,7 @@ class MLRecommender:
         if not rows:
             return pd.DataFrame()
 
-        return pd.DataFrame(rows).sort_values(
+        return filter_recommendations_df(pd.DataFrame(rows)).sort_values(
             ["MLConfidence", "MLSupportCount"],
             ascending=False,
         )

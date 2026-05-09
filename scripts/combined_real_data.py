@@ -2,6 +2,7 @@ from pathlib import Path
 import pandas as pd
 
 from DataLayer.cleaner import DataCleaner
+from DataLayer.access_exclusions import filter_group_list, filter_recommendations_df, filter_user_groups_df
 from ProductLayer.hybrid_recommender import HybridRecommender
 
 
@@ -10,7 +11,7 @@ def main():
     cleaned_path = project_root / "data" / "processed" / "clean_users.parquet"
 
     cleaner = DataCleaner(processed_path=str(cleaned_path))
-    users_df = cleaner.load_cleaned()
+    users_df = filter_user_groups_df(cleaner.load_cleaned())
 
     print("Loaded users:", len(users_df))
     print(users_df[["SamAccountName", "DisplayName", "Title", "Department"]].head())
@@ -52,13 +53,14 @@ def main():
         min_ml_support=1,
         include_supervisors=False,
     )
-    actual_groups = set(
+    actual_groups = set(filter_group_list(
         users_df.loc[
             users_df["SamAccountName"] == target_user,
             "GroupsList"
         ].iloc[0]
-    )
+    ))
 
+    results = filter_recommendations_df(results)
     recommended_groups = set(results["GroupName"])
 
     correct = actual_groups.intersection(recommended_groups)

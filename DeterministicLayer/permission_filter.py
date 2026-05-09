@@ -1,5 +1,7 @@
 import pandas as pd
 
+from DataLayer.access_exclusions import is_excluded_permission
+
 
 class PermissionFilter:
     def __init__(self):
@@ -27,7 +29,10 @@ class PermissionFilter:
 
     def should_ignore(self, group_name: str) -> bool:
         group_lower = str(group_name).lower()
-        return any(keyword in group_lower for keyword in self.ignore_keywords)
+        return (
+            is_excluded_permission(group_name)
+            or any(keyword in group_lower for keyword in self.ignore_keywords)
+        )
 
     def is_door_access(self, row) -> bool:
         group_lower = str(row.get("GroupName", "")).lower()

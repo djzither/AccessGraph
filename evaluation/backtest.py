@@ -59,6 +59,7 @@ import pandas as pd
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from ProductLayer.AccessRecommendationEngine import AccessRecommendationEngine
+from DataLayer.access_exclusions import filter_group_list, filter_reference_df, filter_recommendations_df, filter_user_groups_df
 
 
 # ---------------------------------------------------------------------------
@@ -86,19 +87,19 @@ def _as_group_list(value) -> list[str]:
         return []
 
     if isinstance(value, (list, tuple, set)):
-        return [str(g).strip() for g in value if str(g).strip()]
+        return filter_group_list([str(g).strip() for g in value if str(g).strip()])
 
     # Handles numpy arrays without importing numpy directly
     if hasattr(value, "tolist") and not isinstance(value, str):
         value = value.tolist()
         if isinstance(value, list):
-            return [str(g).strip() for g in value if str(g).strip()]
+            return filter_group_list([str(g).strip() for g in value if str(g).strip()])
 
     if isinstance(value, float) and pd.isna(value):
         return []
 
     # Fallback for semicolon-delimited strings
-    return [g.strip() for g in str(value).split(";") if g.strip()]
+    return filter_group_list([g.strip() for g in str(value).split(";") if g.strip()])
 
 def _norm(value) -> str:
     """Normalize labels for safer metric checks."""
@@ -126,9 +127,9 @@ class BacktestRunner:
         score_threshold: float = 0.35,
         seed: int = 42,
     ):
-        self.users_df = users_df.copy()
+        self.users_df = filter_user_groups_df(users_df)
         self.reference_df = (
-            reference_df
+            filter_reference_df(reference_df)
             if reference_df is not None and not reference_df.empty
             else _empty_reference_df()
         )
@@ -219,7 +220,7 @@ class BacktestRunner:
             recoverable_groups=set(recoverable_groups),
             rare_groups=set(rare_groups),
             unique_groups=set(unique_groups),
-            recs=recs,
+            recs=filter_recommendations_df(recs),
         )
 
     def run_batch(self, n_users: int = 50) -> pd.DataFrame:

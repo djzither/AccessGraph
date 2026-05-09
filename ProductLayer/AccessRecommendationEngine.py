@@ -2,6 +2,12 @@ import pandas as pd
 from collections import Counter
 import re
 
+from DataLayer.access_exclusions import (
+    filter_group_list,
+    filter_recommendations_df,
+    filter_reference_df,
+    filter_user_groups_df,
+)
 from DeterministicLayer.permission_filter import PermissionFilter
 from DeterministicLayer.permission_matrix import PermissionMatrixBuilder
 from DeterministicLayer.title_embed_matcher import TitleEmbedMatcher
@@ -58,6 +64,8 @@ class AccessRecommendationEngine:
         copy_from_netid: str | None = None,
         new_hire_netid: str | None = None,
     ) -> pd.DataFrame:
+        users_df = filter_user_groups_df(users_df)
+        reference_df = filter_reference_df(reference_df)
 
         reference_recs = self._get_reference_recommendations(
             reference_df=reference_df,
@@ -112,6 +120,8 @@ class AccessRecommendationEngine:
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
         merged["Reason"] = merged.apply(self._reason, axis=1)
 
+        merged = filter_recommendations_df(merged)
+
         return merged.sort_values(
             by=["FinalScore", "GroupName"],
             ascending=[False, True],
@@ -129,6 +139,7 @@ class AccessRecommendationEngine:
     ) -> pd.DataFrame:
 
         ref = reference_df.copy()
+        ref = filter_reference_df(ref)
 
         ref["JobTitleClean"] = ref["JobTitle"].apply(self._normalize_role_text)
         ref["DepartmentClean"] = ref["Department"].apply(self._normalize_role_text)
@@ -245,7 +256,7 @@ class AccessRecommendationEngine:
         counter = Counter()
 
         for groups in comparison_cohort["GroupsList"]:
-            counter.update(groups)
+            counter.update(filter_group_list(groups))
 
         rows = []
 
@@ -271,6 +282,8 @@ class AccessRecommendationEngine:
                 "UserCountWithGroup",
                 "TotalUsersInRole",
             ])
+
+        recs = filter_recommendations_df(recs)
 
         return recs.sort_values(
             by=["ADConfidence", "UserCountWithGroup", "GroupName"],
@@ -360,7 +373,7 @@ class AccessRecommendationEngine:
                 "CopyFromNetID",
             ])
 
-        rights = user.iloc[0]["GroupsList"]
+        rights = filter_group_list(user.iloc[0]["GroupsList"])
 
         rows = []
 
@@ -371,7 +384,7 @@ class AccessRecommendationEngine:
                 "CopyFromNetID": copy_from_netid,
             })
 
-        return pd.DataFrame(rows)
+        return filter_recommendations_df(pd.DataFrame(rows))
 
     def _merge_all_sources(
             self,
@@ -626,7 +639,7 @@ class AccessRecommendationEngine:
             | (df["ADConfidence"] >= 0.6)
             | df["CopyFromUserHasIt"]
         )
-        return df[keep].copy()
+        return filter_recommendations_df(df[keep].copy())
 
     def _select_ad_comparison_cohort(
         self,
@@ -703,7 +716,7 @@ class AccessRecommendationEngine:
         total = max(len(users), 1)
         counts = Counter()
         for groups in users["GroupsList"]:
-            normalized = {self._normalize_group_name(g) for g in groups}
+            normalized = {self._normalize_group_name(g) for g in filter_group_list(groups)}
             counts.update(normalized)
         return {k: v / total for k, v in counts.items()}
 
@@ -722,7 +735,7 @@ class AccessRecommendationEngine:
             cohort = cohort.copy()
             cohort["_overlap"] = cohort["GroupsList"].apply(
                 lambda groups: sum(
-                    1 for g in groups
+                    1 for g in filter_group_list(groups)
                     if self._normalize_group_name(g) in reference_group_names
                 )
             )
