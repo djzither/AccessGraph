@@ -118,7 +118,7 @@ class AccessRecommendationEngine:
 
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
-        merged["Reason"] = merged.apply(self._reason, axis=1)
+        merged["Reason"] = self._build_reason_series(merged)
 
         merged = filter_recommendations_df(merged)
 
@@ -412,19 +412,25 @@ class AccessRecommendationEngine:
             copy_from_recs: pd.DataFrame,
     ) -> pd.DataFrame:
 
+        def _ensure_group_key_dtype(df: pd.DataFrame) -> pd.DataFrame:
+            """Force merge keys to object dtype even for empty frames."""
+            out = df.copy()
+            if "GroupNameClean" not in out.columns:
+                out["GroupNameClean"] = ""
+            if "GroupName" not in out.columns:
+                out["GroupName"] = ""
+
+            out["GroupNameClean"] = out["GroupNameClean"].fillna("").astype(str)
+            out["GroupName"] = out["GroupName"].fillna("").astype(str)
+            return out
+
         def add_group_clean(df: pd.DataFrame) -> pd.DataFrame:
-            df = df.copy()
-
-            if "GroupNameClean" not in df.columns:
-                df["GroupNameClean"] = ""
-
-            if "GroupName" not in df.columns:
-                df["GroupName"] = ""
+            df = _ensure_group_key_dtype(df)
 
             if not df.empty:
                 df["GroupNameClean"] = df["GroupName"].apply(self._normalize_group_name)
 
-            return df
+            return _ensure_group_key_dtype(df)
 
         reference_recs = add_group_clean(reference_recs)
         ad_recs = add_group_clean(ad_recs)
@@ -439,7 +445,10 @@ class AccessRecommendationEngine:
             if not df.empty and "GroupNameClean" in df.columns:
                 all_group_names.update(df["GroupNameClean"].dropna().astype(str))
 
-        base = pd.DataFrame({"GroupNameClean": sorted(all_group_names)})
+        base = pd.DataFrame({
+            "GroupNameClean": pd.Series(sorted(all_group_names), dtype="object")
+        })
+        base = _ensure_group_key_dtype(base)
 
         merged = base.merge(reference_recs, on="GroupNameClean", how="left")
         merged = merged.merge(ad_recs, on="GroupNameClean", how="left", suffixes=("", "_AD"))
@@ -643,6 +652,35 @@ class AccessRecommendationEngine:
             f"global_rate={row.get('GlobalGroupRate', 0):.2f}"
         )
         return "Recommended because it is " + ", and ".join(reasons) + f". Confidence: {confidence_bits}."
+
+    def _build_reason_series(self, merged: pd.DataFrame) -> pd.Series:
+        """
+        Build a stable 1-D reason series even if row-wise apply expands to a DataFrame.
+        """
+        raw_reasons = merged.apply(self._reason, axis=1)
+
+        def _clean_reason(value: object) -> str:
+            text = "" if value is None else str(value).strip()
+            if not text or text.lower() == "nan":
+                return "No strong evidence found."
+            return text
+
+        if isinstance(raw_reasons, pd.DataFrame):
+            # Defensive fallback: pick first non-empty reason-like value per row.
+            return raw_reasons.apply(
+                lambda row: next(
+                    (
+                        normalized
+                        for value in row.tolist()
+                        for normalized in [_clean_reason(value)]
+                        if normalized != "No strong evidence found."
+                    ),
+                    "No strong evidence found.",
+                ),
+                axis=1,
+            )
+
+        return raw_reasons.apply(_clean_reason)
 
     def _apply_signal_filters(self, merged: pd.DataFrame) -> pd.DataFrame:
         if merged.empty:
