@@ -106,8 +106,8 @@ class HybridRecommender:
         df["FoundByML"] = df["MLConfidence"] > 0
 
         df["HybridScore"] = (
-            0.65 * df["RulesConfidence"]
-            + 0.35 * df["MLConfidence"]
+            0.5 * df["RulesConfidence"]
+            + 0.5 * df["MLConfidence"]
         ).round(3)
 
         df["FinalDecision"] = df.apply(self._decision_logic, axis=1)
@@ -135,7 +135,11 @@ class HybridRecommender:
             return "Manual Review"
 
         if found_by_rules and found_by_ml:
-            if rules_conf >= 0.8 and ml_conf >= 0.6:
+            # Strong consensus from both signals can elevate confidence.
+            # We allow either:
+            # - strong rules + moderate ML, or
+            # - strong ML + moderate rules.
+            if (rules_conf >= 0.8 and ml_conf >= 0.6) or (ml_conf >= 0.8 and rules_conf >= 0.6):
                 return "Strong Recommend"
             return "Suggest"
 
@@ -148,9 +152,10 @@ class HybridRecommender:
                 return "Suggest"
 
         if found_by_ml:
-            if ml_conf >= 0.8:
+            # ML-only recommendations stay conservative to reduce noise.
+            if ml_conf >= 0.85:
                 return "Suggest"
-            if ml_conf >= 0.5:
+            if ml_conf >= 0.6:
                 return "Low Confidence"
 
         return "Ignore"
