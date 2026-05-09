@@ -236,18 +236,14 @@ class AccessRecommendationEngine:
         rows = []
 
         for group_name, count in counter.items():
-            # Laplace smoothing: add AD_SMOOTHING_FACTOR pseudo-observations so
-            # a group seen by 2/3 users in a tiny cohort doesn't score 0.67 — it
-            # scores 2/(3+5)=0.25, which better reflects how unreliable that is.
-            smoothed = round(count / (total_users + self.AD_SMOOTHING_FACTOR), 3)
+            raw_confidence = round(count / total_users, 3)
 
-            if smoothed < self.matrix_builder.min_confidence:
+            if raw_confidence < self.matrix_builder.min_confidence:
                 continue
 
             rows.append({
                 "GroupName": group_name,
-                "ADConfidence": smoothed,
-                "ADRawConfidence": round(count / total_users, 3),
+                "ADConfidence": raw_confidence,
                 "UserCountWithGroup": count,
                 "TotalUsersInRole": total_users,
             })
@@ -405,12 +401,45 @@ class AccessRecommendationEngine:
         merged = merged.merge(ml_recs, on="GroupNameClean", how="left", suffixes=("", "_ML"))
         merged = merged.merge(copy_from_recs, on="GroupNameClean", how="left", suffixes=("", "_Copy"))
 
-        merged["GroupName"] = (
-            merged["GroupName"]
-            .fillna(merged.get("GroupName_AD"))
-            .fillna(merged.get("GroupName_ML"))
-            .fillna(merged.get("GroupName_Copy"))
-        )
+        def choose_group_name(row) -> str:
+            ref_name = row.get("GroupName")
+            ad_name = row.get("GroupName_AD")
+            ml_name = row.get("GroupName_ML")
+            copy_name = row.get("GroupName_Copy")
+
+            for candidate in (ad_name, ml_name, copy_name, ref_name):
+                if pd.notna(candidate) and str(candidate).strip():
+                    fallback = str(candidate)
+                    break
+            else:
+                return ""
+
+            if not (pd.notna(ref_name) and str(ref_name).strip()):
+                return fallback
+
+            ref_text = str(ref_name).strip()
+            if pd.notna(ad_name) and str(ad_name).strip():
+                ad_text = str(ad_name).strip()
+                ad_lower = ad_text.lower()
+                ref_lower = ref_text.lower()
+
+                # Keep AD label when reference carries a domain prefix variant.
+                if ref_lower.startswith("dce.") or ref_lower.startswith("dce-") or ref_lower.startswith("dce "):
+                    return ad_text
+
+                # Keep reference label when AD uses technical transport prefixes.
+                if ad_lower.startswith("m.") or ad_lower.startswith("i."):
+                    return ref_text
+
+                # Prefer AD/copy label when it is the same normalized right but
+                # human formatting differs (e.g., spaces vs hyphens).
+                if self._normalize_group_name(ad_text) == self._normalize_group_name(ref_text):
+                    if " " in ad_text and "-" in ref_text:
+                        return ad_text
+
+            return ref_text
+
+        merged["GroupName"] = merged.apply(choose_group_name, axis=1)
 
 
         merged["InReferenceSheet"] = merged["InReferenceSheet"].fillna(False)
@@ -456,14 +485,6 @@ class AccessRecommendationEngine:
             ad_weights = (0.20, 0.10, 0.05)
             ml_weights = (0.10, 0.05, 0.03)
             copy_weight = 0.05
-
-        # Scale AD/ML weight by cohort reliability; boost reference when cohort is small.
-        cohort_size = int(row.get("TotalUsersInRole", 0))
-        cohort_factor = min(1.0, cohort_size / self.MIN_RELIABLE_COHORT)
-        ad_weights = tuple(w * cohort_factor for w in ad_weights)
-        ml_weights = tuple(w * cohort_factor for w in ml_weights)
-        if cohort_factor < 1.0 and not is_fsy_role:
-            reference_weight = min(0.80, reference_weight + (1 - cohort_factor) * 0.20)
 
         if row["InReferenceSheet"]:
             score += reference_weight
@@ -592,10 +613,11 @@ class AccessRecommendationEngine:
                 copy_dept_clean = copy_user.iloc[0]["DepartmentClean"]
                 same_department = users[users["DepartmentClean"] == copy_dept_clean].copy()
 
-        if len(same_department) >= self.MIN_COHORT_SIZE:
-            return self._refine_by_reference_overlap(
-                same_department, reference_group_names, title_clean
-            )
+        refined_same_department = self._refine_by_reference_overlap(
+            same_department, reference_group_names, title_clean
+        )
+        if len(same_department) >= self.MIN_COHORT_SIZE or len(refined_same_department) >= 3:
+            return refined_same_department
 
         # Level 3: title cross-department
         cross_dept = users[users["TitleClean"] == title_clean].copy()
@@ -661,7 +683,7 @@ class AccessRecommendationEngine:
     def _normalize_group_name(cls, value) -> str:
         text = str(value).lower().strip()
 
-        for prefix in ("m.", "i."):
+        for prefix in ("m.", "i.", "dce.", "dce-", "dce "):
             if text.startswith(prefix):
                 text = text[len(prefix):]
                 break
