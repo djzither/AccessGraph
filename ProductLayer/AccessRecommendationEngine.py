@@ -13,6 +13,11 @@ from DataLayer.workforce_type import (
     canonical_from_ui_label,
     reference_match_value,
 )
+from DataLayer.peer_cohort import (
+    build_peer_pool_from_anchor,
+    build_target_user_row,
+    contamination_stats_for_group,
+)
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_labels import apply_access_pattern_columns
 from DeterministicLayer.permission_filter import PermissionFilter
@@ -85,6 +90,13 @@ class AccessRecommendationEngine:
             copy_from_netid=copy_from_netid,
         )
 
+        target_user_row = build_target_user_row(
+            title=title,
+            department=department,
+            employee_type=employee_type,
+            sam_account_name=new_hire_netid or "",
+        )
+        peer_pool_metadata: dict[str, object] = {}
         comparison_cohort = self._select_ad_comparison_cohort(
             users_df=users_df,
             title=title,
@@ -92,6 +104,8 @@ class AccessRecommendationEngine:
             reference_recs=reference_recs,
             employee_type=employee_type,
             copy_from_netid=copy_from_netid,
+            target_user_row=target_user_row,
+            peer_pool_metadata=peer_pool_metadata,
         )
 
         ad_recs = self._get_ad_recommendations(
@@ -129,9 +143,26 @@ class AccessRecommendationEngine:
         merged["IsFSYRole"] = self._is_fsy_role(title=title, department=department)
         merged["CohortSize"] = len(comparison_cohort)
         merged["CohortReliability"] = min(1.0, len(comparison_cohort) / self.MIN_RELIABLE_COHORT)
+        for meta_key, default in {
+            "AnchorUserName": "",
+            "AnchorUserTitle": "",
+            "AnchorUserType": "",
+            "PeerPoolSize": len(comparison_cohort),
+            "SupervisorUsersExcluded": "",
+            "OutlierUsersExcluded": "",
+            "PeerPoolComposition": "",
+            "PeerUsers": "",
+        }.items():
+            merged[meta_key] = peer_pool_metadata.get(meta_key, default)
 
         merged = self.permission_filter.filter_recommendations(merged)
         merged = self._apply_signal_filters(merged)
+        merged = self._apply_peer_contamination_metadata(
+            merged=merged,
+            comparison_cohort=comparison_cohort,
+            peer_pool_metadata=peer_pool_metadata,
+            target_user_row=target_user_row,
+        )
 
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
@@ -164,9 +195,35 @@ class AccessRecommendationEngine:
         ref = reference_df.copy()
         ref = filter_reference_df(ref)
 
+        empty_reference_columns = [
+            "GroupNameClean",
+            "GroupName",
+            "InReferenceSheet",
+            "ReferenceCategories",
+            "ReferenceTemplateCount",
+            "AmbiguousReferenceTemplate",
+        ]
+        if ref.empty:
+            return pd.DataFrame(columns=empty_reference_columns)
+
+        for column, default in (
+            ("JobTitle", ""),
+            ("Department", ""),
+            ("EmployeeType", ""),
+            ("Supervisor", ""),
+            ("AccessName", ""),
+        ):
+            if column not in ref.columns:
+                ref[column] = default
+
         ref["JobTitleClean"] = ref["JobTitle"].apply(self._normalize_role_text)
         ref["DepartmentClean"] = ref["Department"].apply(self._normalize_role_text)
-        ref["EmployeeTypeClean"] = ref["EmployeeType"].astype(str).str.lower().str.strip()
+        if "EmployeeTypeClean" in ref.columns:
+            ref["EmployeeTypeClean"] = ref["EmployeeTypeClean"].astype(str).str.lower().str.strip()
+        elif "EmployeeType" in ref.columns:
+            ref["EmployeeTypeClean"] = ref["EmployeeType"].astype(str).str.lower().str.strip()
+        else:
+            ref["EmployeeTypeClean"] = ""
         ref["SupervisorClean"] = ref["Supervisor"].astype(str).str.lower().str.strip()
         ref["AccessNameClean"] = ref["AccessName"].apply(self._normalize_group_name)
         if "ReferenceEmployeeName" in ref.columns:
@@ -189,6 +246,12 @@ class AccessRecommendationEngine:
                 axis=1,
             )
         ].copy()
+
+        if "EmployeeTypeClean" not in matched.columns:
+            if "EmployeeType" in matched.columns:
+                matched["EmployeeTypeClean"] = matched["EmployeeType"].astype(str).str.lower().str.strip()
+            else:
+                matched["EmployeeTypeClean"] = ""
 
         if employee_type_clean is not None:
             matched = matched[matched["EmployeeTypeClean"] == employee_type_clean].copy()
@@ -614,6 +677,9 @@ class AccessRecommendationEngine:
             bool(row.get("CohortWorkforceFallback", False))
             or bool(row.get("MLWorkforcePoolFallback", False))
         ) else 1.0
+        contamination_penalty = 0.35 if bool(row.get("SupervisorContaminationFlag", False)) else 1.0
+        if contamination_penalty < 1.0 and employee_type_clean == "student":
+            workforce_penalty *= contamination_penalty
         ad_signal = (
             float(row["ADConfidence"]) * cohort_reliability * commonality_penalty * workforce_penalty
         )
@@ -638,6 +704,17 @@ class AccessRecommendationEngine:
 
         if row["CopyFromUserHasIt"]:
             score += copy_weight
+            if employee_type_clean == "student" and bool(row.get("SupervisorContaminationFlag", False)):
+                score = min(score, copy_weight + 0.05)
+
+        peer_student_support = int(row.get("PeerStudentSupportCount", 0) or 0)
+        if (
+            employee_type_clean == "student"
+            and peer_student_support >= 2
+            and float(row["ADConfidence"]) >= 0.99
+            and not bool(row.get("SupervisorContaminationFlag", False))
+        ):
+            score = max(score, 0.55)
 
         if row["InReferenceSheet"] and not is_ambiguous_ref:
             score = max(score, reference_weight)
@@ -650,6 +727,11 @@ class AccessRecommendationEngine:
     def _final_decision(self, row) -> str:
         if row["RiskLevel"] == "High":
             return "Manual Review"
+
+        if bool(row.get("SupervisorContaminationFlag", False)):
+            employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
+            if employee_type_clean == "student" and not bool(row.get("InReferenceSheet", False)):
+                return "Manual Review"
 
         score = row["FinalScore"]
 
@@ -707,6 +789,36 @@ class AccessRecommendationEngine:
 
         if row["CopyFromUserHasIt"]:
             reasons.append(f"present on copy-from user {row['CopyFromNetID']}")
+
+        anchor_name = str(row.get("AnchorUserName", "")).strip()
+        if anchor_name:
+            reasons.append(f"peer baseline built from users similar to {anchor_name}")
+
+        peer_users = str(row.get("PeerUsers", "")).strip()
+        if peer_users:
+            reasons.append(f"peer users used: {peer_users}")
+
+        supervisors_excluded = str(row.get("SupervisorUsersExcluded", "")).strip()
+        if supervisors_excluded:
+            reasons.append(f"supervisors excluded: {supervisors_excluded}")
+
+        outliers_excluded = str(row.get("OutlierUsersExcluded", "")).strip()
+        if outliers_excluded:
+            reasons.append(f"outliers excluded: {outliers_excluded}")
+
+        if bool(row.get("SupervisorContaminationFlag", False)):
+            reasons.append(
+                "recommendation confidence reduced due to supervisor contamination risk"
+            )
+            reasons.append(
+                "peer evidence="
+                f"{int(row.get('PeerStudentSupportCount', 0))}; "
+                f"supervisor evidence={int(row.get('SupervisorSupportCount', 0))}"
+            )
+
+        review_reason = str(row.get("ReviewReason", "")).strip()
+        if review_reason:
+            reasons.append(review_reason)
 
         if not reasons:
             return "No strong evidence found."
@@ -798,7 +910,9 @@ class AccessRecommendationEngine:
             return out
         mix = {str(k): int(v) for k, v in cohort["EmployeeType"].value_counts().items()}
         meta["workforce_mix"] = mix
-        strict = cohort[cohort["EmployeeType"] == target_canonical].copy()
+        strict = cohort[
+            cohort["EmployeeType"].apply(canonical_from_ui_label) == target_canonical
+        ].copy()
         if len(strict) >= self.MIN_COHORT_SIZE:
             strict.attrs = {**meta, "workforce_fallback": False}
             return strict
@@ -806,9 +920,38 @@ class AccessRecommendationEngine:
             out = cohort.copy()
             out.attrs = {**meta, "workforce_fallback": True}
             return out
-        out = cohort.copy()
-        out.attrs = {**meta, "workforce_fallback": True}
-        return out
+        strict.attrs = {**meta, "workforce_fallback": False}
+        return strict
+
+    def _apply_peer_contamination_metadata(
+        self,
+        merged: pd.DataFrame,
+        comparison_cohort: pd.DataFrame,
+        peer_pool_metadata: dict[str, object],
+        target_user_row: dict[str, object],
+    ) -> pd.DataFrame:
+        if merged.empty:
+            return merged
+
+        df = merged.copy()
+        target_is_student = str(target_user_row.get("EmployeeType", "")).lower().strip() == "student"
+        for idx, row in df.iterrows():
+            stats = contamination_stats_for_group(
+                comparison_cohort,
+                str(row["GroupName"]),
+                normalizer=self._normalize_group_name,
+            )
+            row_meta = stats.as_row_metadata()
+            if not target_is_student:
+                row_meta["SupervisorContaminationFlag"] = False
+                row_meta["ReviewReason"] = ""
+            for key, value in row_meta.items():
+                df.at[idx, key] = value
+
+        for key, value in peer_pool_metadata.items():
+            if key not in df.columns:
+                df[key] = value
+        return df
 
     def _select_ad_comparison_cohort(
         self,
@@ -818,6 +961,8 @@ class AccessRecommendationEngine:
         reference_recs: pd.DataFrame,
         employee_type: str,
         copy_from_netid: str | None = None,
+        target_user_row: dict[str, object] | None = None,
+        peer_pool_metadata: dict[str, object] | None = None,
     ) -> pd.DataFrame:
         """
         Build the best comparison cohort using a 4-level fallback strategy.
@@ -844,6 +989,33 @@ class AccessRecommendationEngine:
             reference_group_names = set(
                 reference_recs["GroupNameClean"].dropna().astype(str)
             )
+
+        if copy_from_netid is not None:
+            anchor_rows = users[users["SamAccountName"] == copy_from_netid]
+            if not anchor_rows.empty:
+                anchor_row = anchor_rows.iloc[0]
+                peer_result = build_peer_pool_from_anchor(
+                    users_df=users,
+                    anchor_user_row=anchor_row,
+                    target_user_row=target_user_row or build_target_user_row(
+                        title=title,
+                        department=department,
+                        employee_type=employee_type,
+                    ),
+                )
+                if peer_pool_metadata is not None:
+                    peer_pool_metadata.update(peer_result.as_metadata())
+                anchor_pool = peer_result.peer_pool
+                if not anchor_pool.empty:
+                    anchor_workforce = self._cohort_with_workforce(anchor_pool, target_canonical)
+                    if len(anchor_workforce) >= 2:
+                        refined_anchor = self._refine_by_reference_overlap(
+                            anchor_workforce,
+                            reference_group_names,
+                            title_clean,
+                        )
+                        refined_anchor.attrs = getattr(anchor_workforce, "attrs", {}).copy()
+                        return refined_anchor
 
         # Level 1: exact title + department
         exact_cohort = users[
