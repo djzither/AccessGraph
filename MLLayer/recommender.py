@@ -1,6 +1,7 @@
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list, filter_recommendations_df, filter_user_groups_df
+from DataLayer.workforce_type import canonical_from_ui_label
 from MLLayer.similarity_model import SimilarityModel
 
 
@@ -290,10 +291,12 @@ class MLRecommender:
         role_peers = filter_user_groups_df(cohort_df)
         ml_wf_fb = bool(peer_aggregate_fallback)
         if workforce_segment is not None and "EmployeeType" in role_peers.columns:
-            strict = role_peers[role_peers["EmployeeType"] == workforce_segment].copy()
+            strict = role_peers[
+                role_peers["EmployeeType"].apply(canonical_from_ui_label) == workforce_segment
+            ].copy()
             if len(strict) >= 2:
                 role_peers = strict
-            elif len(strict) < len(role_peers):
+            elif strict.empty and len(role_peers) > 0:
                 ml_wf_fb = True
 
         if "SamAccountName" in role_peers.columns:
