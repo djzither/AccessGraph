@@ -20,6 +20,7 @@ from DataLayer.data_paths import (
 )
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
 from DataLayer.permission_cooccurrence import build_cooccurrence_state, cooccurrence_from_state
+from DataLayer.peer_cohort import build_target_user_row
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_analyzer import AccessPatternAnalyzer
 from DeterministicLayer.privilege_audit import PrivilegeAuditAnalyzer
@@ -562,6 +563,24 @@ def render_onboarding_tab(
 
     st.divider()
 
+    cohort_meta = recs.iloc[0] if not recs.empty else None
+    if cohort_meta is not None:
+        anchor_name = str(cohort_meta.get("AnchorUserName", "")).strip()
+        if anchor_name:
+            st.markdown(f"Peer baseline built from users similar to: **{anchor_name}**")
+        peer_users = str(cohort_meta.get("PeerUsers", "")).strip()
+        supervisors_excluded = str(cohort_meta.get("SupervisorUsersExcluded", "")).strip()
+        outliers_excluded = str(cohort_meta.get("OutlierUsersExcluded", "")).strip()
+        peer_bits: list[str] = []
+        if peer_users:
+            peer_bits.append(f"Peer users used: `{peer_users}`")
+        if supervisors_excluded:
+            peer_bits.append(f"Supervisors excluded: `{supervisors_excluded}`")
+        if outliers_excluded:
+            peer_bits.append(f"Outliers excluded: `{outliers_excluded}`")
+        if peer_bits:
+            st.caption(" · ".join(peer_bits))
+
     # ── Results table ─────────────────────────────────────────────────────────
     display_cols = [
         "GroupName", "AccessPattern", "FinalDecision", "FinalScore", "RiskLevel",
@@ -616,6 +635,12 @@ def render_onboarding_tab(
                     users_df=users_for_recs,
                     copy_from_netid=copy_from or None,
                 )
+                target_user_row = build_target_user_row(
+                    title=title,
+                    department=department,
+                    employee_type=employee_type,
+                    sam_account_name=new_hire_netid or "",
+                )
                 comparison_cohort = engine._select_ad_comparison_cohort(
                     users_df=users_for_recs,
                     title=title,
@@ -623,6 +648,7 @@ def render_onboarding_tab(
                     reference_recs=reference_recs,
                     employee_type=employee_type,
                     copy_from_netid=copy_from or None,
+                    target_user_row=target_user_row,
                 )
                 cohort_size = len(comparison_cohort)
                 sub_df = analyze_recommendation_subgroups(
@@ -699,6 +725,20 @@ def render_onboarding_tab(
             expander_label = f"{gname} — co-occurrence"
 
         with st.expander(expander_label, expanded=False):
+            peer_student = int(rrow.get("PeerStudentSupportCount", 0) or 0)
+            supervisor_support = int(rrow.get("SupervisorSupportCount", 0) or 0)
+            contamination = bool(rrow.get("SupervisorContaminationFlag", False))
+            if peer_student or supervisor_support or contamination:
+                st.markdown("### Peer vs supervisor evidence")
+                st.markdown(
+                    f"- Peer evidence: **{peer_student}** student/comparable peers\n"
+                    f"- Supervisor evidence: **{supervisor_support}** supervisor-like peers"
+                )
+                if contamination:
+                    st.warning(
+                        "Recommendation confidence reduced due to supervisor contamination risk."
+                    )
+
             if has_sub:
                 specialized = assessment == "Subrole Access"
                 with_users = diag.get("users_with_permission") or []
