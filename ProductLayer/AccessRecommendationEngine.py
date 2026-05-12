@@ -33,6 +33,15 @@ class AccessRecommendationEngine:
     AD_SMOOTHING_FACTOR = 5   # Laplace pseudo-count added to denominator
     MAX_COMMON_GROUP_RATE = 0.80
     MIN_ML_SIMILARITY = 0.25
+    ML_SCOPE_CURRENT = "current"
+    ML_SCOPE_AD_COHORT = "ad_cohort"
+    ML_SCOPE_HYBRID = "hybrid"
+    ML_SCOPES = frozenset({ML_SCOPE_CURRENT, ML_SCOPE_AD_COHORT, ML_SCOPE_HYBRID})
+    ML_EVIDENCE_STRONG_INSIDE_AD = "strong_inside_ad"
+    ML_EVIDENCE_USABLE_INSIDE_AD = "usable_inside_ad"
+    ML_EVIDENCE_EXTERNAL_ONLY = "external_only"
+    ML_EVIDENCE_NO_ML_SUPPORT = "no_ml_support"
+    ML_EVIDENCE_COHORT_TOO_SMALL = "cohort_too_small"
 
     ROLE_ALIASES = {
         (
@@ -59,10 +68,15 @@ class AccessRecommendationEngine:
         self,
         min_confidence: float = 0.5,
         title_matcher: TitleEmbedMatcher | None = None,
+        ml_scope: str = "current",
     ):
+        if ml_scope not in self.ML_SCOPES:
+            allowed = ", ".join(sorted(self.ML_SCOPES))
+            raise ValueError(f"ml_scope must be one of: {allowed}")
         self.matrix_builder = PermissionMatrixBuilder(min_confidence=min_confidence)
         self.permission_filter = PermissionFilter()
         self.title_matcher = title_matcher
+        self.ml_scope = ml_scope
         self._global_group_rates = {}
 
     def recommend_for_hire(
@@ -112,7 +126,7 @@ class AccessRecommendationEngine:
             comparison_cohort=comparison_cohort,
         )
 
-        ml_recs = self._get_ml_recommendations(
+        ml_recs, ml_audit = self._get_ml_recommendations(
             users_df=users_df,
             new_hire_netid=new_hire_netid,
             department=department,
@@ -131,6 +145,7 @@ class AccessRecommendationEngine:
             ml_recs=ml_recs,
             copy_from_recs=copy_from_recs,
         )
+        merged = self._apply_ml_scope_diagnostics(merged, ml_audit)
         wattrs = getattr(comparison_cohort, "attrs", None) or {}
         mix = wattrs.get("workforce_mix") or {}
         mix_str = ", ".join(f"{k}={v}" for k, v in sorted(mix.items()))
@@ -427,49 +442,20 @@ class AccessRecommendationEngine:
             ]
         ]
 
-    def _get_ml_recommendations(
-        self,
-        users_df: pd.DataFrame,
-        new_hire_netid: str | None,
-        department: str,
-        comparison_cohort: pd.DataFrame,
-        workforce_segment: str,
-    ) -> pd.DataFrame:
+    @staticmethod
+    def _dataframe_netids(df: pd.DataFrame) -> set[str]:
+        if df.empty or "SamAccountName" not in df.columns:
+            return set()
+        return {
+            str(netid).strip()
+            for netid in df["SamAccountName"].astype(str)
+            if str(netid).strip()
+        }
 
-        ml = MLRecommender(users_df)
-
-        if new_hire_netid is not None:
-            target_user = users_df[users_df["SamAccountName"] == new_hire_netid]
-            segment = workforce_segment
-            if not target_user.empty and "EmployeeType" in target_user.columns:
-                segment = str(target_user.iloc[0]["EmployeeType"])
-            recs = ml.recommend_for_user(
-                sam_account_name=new_hire_netid,
-                department=department,
-                top_n_users=5,
-                min_support=2,
-                include_supervisors=False,
-                workforce_segment=segment,
-            )
-            ml_mode = "target_user"
-            ml_anchor_netid = new_hire_netid
-        else:
-            recs = ml.recommend_for_peer_cohort(
-                cohort_df=comparison_cohort,
-                min_support=2,
-                workforce_segment=workforce_segment,
-                peer_aggregate_fallback=getattr(comparison_cohort, "attrs", {}).get(
-                    "workforce_fallback", False
-                ),
-                respect_anchor_pool=getattr(comparison_cohort, "attrs", {}).get(
-                    "peer_pool_locked", False
-                ),
-            )
-            ml_mode = "peer_aggregate"
-            ml_anchor_netid = ""
-
-        if recs.empty:
-            return pd.DataFrame(columns=[
+    @staticmethod
+    def _empty_ml_recommendations() -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
                 "GroupName",
                 "MLConfidence",
                 "MLSupportCount",
@@ -478,14 +464,19 @@ class AccessRecommendationEngine:
                 "MLMode",
                 "MLAnchorNetID",
                 "MLWorkforcePoolFallback",
-            ])
+            ]
+        )
 
-        recs["MLMode"] = recs.get("MLMode", ml_mode)
-        recs["MLAnchorNetID"] = ml_anchor_netid
-        if "MLWorkforcePoolFallback" not in recs.columns:
-            recs["MLWorkforcePoolFallback"] = False
+    def _harmonize_ml_recommendations(self, recs: pd.DataFrame) -> pd.DataFrame:
+        if recs is None or recs.empty:
+            return self._empty_ml_recommendations()
 
-        return recs[
+        out = recs.copy()
+        out["MLMode"] = out.get("MLMode", "")
+        out["MLAnchorNetID"] = out.get("MLAnchorNetID", "")
+        if "MLWorkforcePoolFallback" not in out.columns:
+            out["MLWorkforcePoolFallback"] = False
+        return out[
             [
                 "GroupName",
                 "MLConfidence",
@@ -497,6 +488,281 @@ class AccessRecommendationEngine:
                 "MLWorkforcePoolFallback",
             ]
         ]
+
+    def _select_ml_recs_for_scoring(
+        self,
+        current_recs: pd.DataFrame,
+        ad_scoped_recs: pd.DataFrame,
+    ) -> pd.DataFrame:
+        current = self._harmonize_ml_recommendations(current_recs)
+        ad_scoped = self._harmonize_ml_recommendations(ad_scoped_recs)
+
+        if self.ml_scope == self.ML_SCOPE_CURRENT:
+            return current
+        if self.ml_scope == self.ML_SCOPE_AD_COHORT:
+            return ad_scoped
+        if current.empty:
+            return ad_scoped
+        if ad_scoped.empty:
+            return current
+
+        current = current.copy()
+        ad_scoped = ad_scoped.copy()
+        current["GroupNameClean"] = current["GroupName"].apply(self._normalize_group_name)
+        ad_scoped["GroupNameClean"] = ad_scoped["GroupName"].apply(self._normalize_group_name)
+        ad_by_key = ad_scoped.set_index("GroupNameClean", drop=False)
+        selected_rows: list[pd.Series] = []
+        seen_keys: set[str] = set()
+
+        for _, row in current.iterrows():
+            key = str(row["GroupNameClean"])
+            seen_keys.add(key)
+            if key in ad_by_key.index and float(ad_by_key.loc[key, "MLConfidence"]) > 0:
+                selected_rows.append(ad_by_key.loc[key])
+            else:
+                selected_rows.append(row)
+
+        for key, ad_row in ad_by_key.iterrows():
+            if key in seen_keys:
+                continue
+            selected_rows.append(ad_row)
+
+        if not selected_rows:
+            return self._empty_ml_recommendations()
+
+        combined = pd.DataFrame(selected_rows)
+        return self._harmonize_ml_recommendations(combined)
+
+    def _ml_peer_aggregate_recommendations(
+        self,
+        ml: MLRecommender,
+        comparison_cohort: pd.DataFrame,
+        workforce_segment: str,
+    ) -> pd.DataFrame:
+        return ml.recommend_for_peer_cohort(
+            cohort_df=comparison_cohort,
+            min_support=2,
+            workforce_segment=workforce_segment,
+            peer_aggregate_fallback=getattr(comparison_cohort, "attrs", {}).get(
+                "workforce_fallback", False
+            ),
+            respect_anchor_pool=getattr(comparison_cohort, "attrs", {}).get(
+                "peer_pool_locked", False
+            ),
+        )
+
+    def _build_ml_scope_audit(
+        self,
+        *,
+        current_recs: pd.DataFrame,
+        ad_scoped_recs: pd.DataFrame,
+        current_ml_pool: pd.DataFrame,
+        comparison_cohort: pd.DataFrame,
+    ) -> dict[str, object]:
+        current_ids = self._dataframe_netids(current_ml_pool)
+        ad_ids = self._dataframe_netids(comparison_cohort)
+        intersection_ids = current_ids & ad_ids
+        ml_only_ids = current_ids - ad_ids
+        ad_only_ids = ad_ids - current_ids
+
+        current_by_group = self._harmonize_ml_recommendations(current_recs).copy()
+        ad_scoped_by_group = self._harmonize_ml_recommendations(ad_scoped_recs).copy()
+        if not current_by_group.empty:
+            current_by_group["GroupNameClean"] = current_by_group["GroupName"].apply(
+                self._normalize_group_name
+            )
+        if not ad_scoped_by_group.empty:
+            ad_scoped_by_group["GroupNameClean"] = ad_scoped_by_group["GroupName"].apply(
+                self._normalize_group_name
+            )
+
+        return {
+            "ml_scope": self.ml_scope,
+            "ad_cohort_size": len(ad_ids),
+            "current_ml_pool_size": len(current_ids),
+            "ml_ad_intersection_size": len(intersection_ids),
+            "ml_only_count": len(ml_only_ids),
+            "ad_only_count": len(ad_only_ids),
+            "current_by_group": current_by_group,
+            "ad_scoped_by_group": ad_scoped_by_group,
+        }
+
+    @classmethod
+    def derive_ml_evidence_quality(
+        cls,
+        *,
+        has_current_ml_support: bool,
+        has_ad_scoped_ml_support: bool,
+        ad_scoped_ml_compared_users: int,
+        ml_ad_cohort_size: int,
+    ) -> str:
+        if has_ad_scoped_ml_support and ad_scoped_ml_compared_users >= 5:
+            return cls.ML_EVIDENCE_STRONG_INSIDE_AD
+        if has_ad_scoped_ml_support and ad_scoped_ml_compared_users < 5:
+            return cls.ML_EVIDENCE_USABLE_INSIDE_AD
+        if has_current_ml_support and not has_ad_scoped_ml_support:
+            return cls.ML_EVIDENCE_EXTERNAL_ONLY
+        if ml_ad_cohort_size > 0 and ad_scoped_ml_compared_users < 2:
+            return cls.ML_EVIDENCE_COHORT_TOO_SMALL
+        return cls.ML_EVIDENCE_NO_ML_SUPPORT
+
+    def _apply_ml_scope_diagnostics(
+        self,
+        merged: pd.DataFrame,
+        ml_audit: dict[str, object],
+    ) -> pd.DataFrame:
+        if merged.empty:
+            return merged
+
+        df = merged.copy()
+        df["MLScope"] = str(ml_audit.get("ml_scope", self.ml_scope))
+        df["MLCurrentPoolSize"] = int(ml_audit.get("current_ml_pool_size", 0) or 0)
+        df["MLAdCohortSize"] = int(ml_audit.get("ad_cohort_size", 0) or 0)
+        df["MLAdIntersectionSize"] = int(ml_audit.get("ml_ad_intersection_size", 0) or 0)
+        df["MLOnlyCount"] = int(ml_audit.get("ml_only_count", 0) or 0)
+        df["ADOnlyCount"] = int(ml_audit.get("ad_only_count", 0) or 0)
+
+        current_by_group = ml_audit.get("current_by_group")
+        ad_scoped_by_group = ml_audit.get("ad_scoped_by_group")
+        if not isinstance(current_by_group, pd.DataFrame):
+            current_by_group = self._empty_ml_recommendations()
+        if not isinstance(ad_scoped_by_group, pd.DataFrame):
+            ad_scoped_by_group = self._empty_ml_recommendations()
+
+        current_lookup: dict[str, float] = {}
+        current_compared_lookup: dict[str, int] = {}
+        if not current_by_group.empty and "GroupNameClean" in current_by_group.columns:
+            for _, row in current_by_group.iterrows():
+                key = str(row["GroupNameClean"])
+                current_lookup[key] = float(row.get("MLConfidence", 0) or 0)
+                current_compared_lookup[key] = int(row.get("MLComparedUsers", 0) or 0)
+        ad_scoped_lookup: dict[str, float] = {}
+        ad_scoped_compared_lookup: dict[str, int] = {}
+        if not ad_scoped_by_group.empty and "GroupNameClean" in ad_scoped_by_group.columns:
+            for _, row in ad_scoped_by_group.iterrows():
+                key = str(row["GroupNameClean"])
+                ad_scoped_lookup[key] = float(row.get("MLConfidence", 0) or 0)
+                ad_scoped_compared_lookup[key] = int(row.get("MLComparedUsers", 0) or 0)
+
+        if "GroupNameClean" not in df.columns:
+            df["GroupNameClean"] = df["GroupName"].apply(self._normalize_group_name)
+
+        current_confidences: list[float] = []
+        ad_scoped_confidences: list[float] = []
+        current_compared_users: list[int] = []
+        ad_scoped_compared_users: list[int] = []
+        has_current_support: list[bool] = []
+        has_ad_scoped_support: list[bool] = []
+        would_lose_support: list[bool] = []
+        ml_evidence_quality: list[str] = []
+        ml_ad_cohort_size = int(ml_audit.get("ad_cohort_size", 0) or 0)
+
+        for _, row in df.iterrows():
+            key = str(row.get("GroupNameClean", ""))
+            current_confidence = current_lookup.get(key, 0.0)
+            ad_scoped_confidence = ad_scoped_lookup.get(key, 0.0)
+            current_compared = current_compared_lookup.get(key, 0)
+            ad_scoped_compared = ad_scoped_compared_lookup.get(key, 0)
+            current_confidences.append(current_confidence)
+            ad_scoped_confidences.append(ad_scoped_confidence)
+            current_compared_users.append(current_compared)
+            ad_scoped_compared_users.append(ad_scoped_compared)
+            has_current = current_confidence > 0
+            has_ad_scoped = ad_scoped_confidence > 0
+            has_current_support.append(has_current)
+            has_ad_scoped_support.append(has_ad_scoped)
+            would_lose_support.append(has_current and not has_ad_scoped)
+            ml_evidence_quality.append(
+                self.derive_ml_evidence_quality(
+                    has_current_ml_support=has_current,
+                    has_ad_scoped_ml_support=has_ad_scoped,
+                    ad_scoped_ml_compared_users=ad_scoped_compared,
+                    ml_ad_cohort_size=ml_ad_cohort_size,
+                )
+            )
+
+        df["CurrentMLConfidence"] = current_confidences
+        df["AdScopedMLConfidence"] = ad_scoped_confidences
+        df["CurrentMLComparedUsers"] = current_compared_users
+        df["AdScopedMLComparedUsers"] = ad_scoped_compared_users
+        df["HasCurrentMLSupport"] = has_current_support
+        df["HasAdScopedMLSupport"] = has_ad_scoped_support
+        df["WouldLoseMLSupportIfScopedToAD"] = would_lose_support
+        df["MLEvidenceQuality"] = ml_evidence_quality
+        return df
+
+    def _get_ml_recommendations(
+        self,
+        users_df: pd.DataFrame,
+        new_hire_netid: str | None,
+        department: str,
+        comparison_cohort: pd.DataFrame,
+        workforce_segment: str,
+    ) -> tuple[pd.DataFrame, dict[str, object]]:
+
+        ml = MLRecommender(users_df)
+
+        if new_hire_netid is not None:
+            target_user = users_df[users_df["SamAccountName"] == new_hire_netid]
+            segment = workforce_segment
+            if not target_user.empty and "EmployeeType" in target_user.columns:
+                segment = str(target_user.iloc[0]["EmployeeType"])
+            target_title = (
+                str(target_user.iloc[0]["Title"])
+                if not target_user.empty and "Title" in target_user.columns
+                else ""
+            )
+            target_department = (
+                str(target_user.iloc[0]["Department"])
+                if not target_user.empty and "Department" in target_user.columns
+                else department
+            )
+            current_recs = ml.recommend_for_user(
+                sam_account_name=new_hire_netid,
+                department=department,
+                top_n_users=5,
+                min_support=2,
+                include_supervisors=False,
+                workforce_segment=segment,
+            )
+            current_pool, _ = ml.similarity_pool_for_user(
+                title=target_title,
+                department=target_department,
+                include_supervisors=False,
+                workforce_segment=segment,
+            )
+            ad_scoped_recs = ml.recommend_for_similarity_pool(
+                new_hire_netid,
+                comparison_cohort,
+                top_n_users=5,
+                min_support=2,
+                pool_wf_fallback=bool(
+                    getattr(comparison_cohort, "attrs", {}).get("workforce_fallback", False)
+                ),
+                ml_mode="ad_cohort",
+                ml_anchor_netid=new_hire_netid,
+            )
+        else:
+            current_recs = self._ml_peer_aggregate_recommendations(
+                ml,
+                comparison_cohort,
+                workforce_segment,
+            )
+            current_pool = comparison_cohort
+            ad_scoped_recs = self._ml_peer_aggregate_recommendations(
+                ml,
+                comparison_cohort,
+                workforce_segment,
+            )
+
+        ml_audit = self._build_ml_scope_audit(
+            current_recs=current_recs,
+            ad_scoped_recs=ad_scoped_recs,
+            current_ml_pool=current_pool,
+            comparison_cohort=comparison_cohort,
+        )
+        scoring_recs = self._select_ml_recs_for_scoring(current_recs, ad_scoped_recs)
+        return scoring_recs, ml_audit
 
     def _get_copy_from_recommendations(
         self,
@@ -919,6 +1185,10 @@ class AccessRecommendationEngine:
         if review_reason:
             reasons.append(review_reason)
 
+        ml_evidence_quality = str(row.get("MLEvidenceQuality", "")).strip()
+        if ml_evidence_quality:
+            reasons.append(f"ML evidence quality is {ml_evidence_quality.replace('_', ' ')}")
+
         if not reasons:
             return "No strong evidence found."
         confidence_bits = (
@@ -927,7 +1197,8 @@ class AccessRecommendationEngine:
             f"ml={row.get('MLConfidence', 0):.2f}; "
             f"support={int(row.get('MLSupportCount', 0))}/{int(row.get('MLComparedUsers', 0))}; "
             f"cohort={int(row.get('CohortSize', 0))}; "
-            f"global_rate={row.get('GlobalGroupRate', 0):.2f}"
+            f"global_rate={row.get('GlobalGroupRate', 0):.2f}; "
+            f"ml_evidence={ml_evidence_quality or 'no_ml_support'}"
         )
         return "Recommended because it is " + ", and ".join(reasons) + f". Confidence: {confidence_bits}."
 

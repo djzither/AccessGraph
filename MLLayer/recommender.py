@@ -18,6 +18,21 @@ class MLRecommender:
         self.users_df = filter_user_groups_df(users_df)
 
     @staticmethod
+    def _empty_similarity_recommendations() -> pd.DataFrame:
+        return pd.DataFrame(
+            columns=[
+                "GroupName",
+                "MLConfidence",
+                "MLSupportCount",
+                "MLComparedUsers",
+                "NearestUsers",
+                "MLMode",
+                "MLAnchorNetID",
+                "MLWorkforcePoolFallback",
+            ]
+        )
+
+    @staticmethod
     def _normalize_text(value: object) -> str:
         return str(value).lower().strip()
 
@@ -169,6 +184,109 @@ class MLRecommender:
         pool, wf_fb3 = self._restrict_workforce(pool, workforce_segment)
         return pool, wf_fb or wf_fb3
 
+    def similarity_pool_for_user(
+        self,
+        *,
+        title: str,
+        department: str,
+        include_supervisors: bool = False,
+        workforce_segment: str | None = None,
+    ) -> tuple[pd.DataFrame, bool]:
+        return self._similarity_pool_for_user(
+            title=title,
+            department=department,
+            include_supervisors=include_supervisors,
+            workforce_segment=workforce_segment,
+        )
+
+    def _recommend_similarity_within_pool(
+        self,
+        *,
+        sam_account_name: str,
+        pool: pd.DataFrame,
+        top_n_users: int,
+        min_support: int,
+        pool_wf_fallback: bool = False,
+        ml_mode: str = "target_user",
+        ml_anchor_netid: str = "",
+    ) -> pd.DataFrame:
+        target_user = self.users_df[self.users_df["SamAccountName"] == sam_account_name]
+        if target_user.empty:
+            raise ValueError(f"{sam_account_name} not found in full user data")
+
+        scoped_pool = filter_user_groups_df(pool).copy()
+        scoped_pool = pd.concat([scoped_pool, target_user], ignore_index=True)
+        scoped_pool = scoped_pool.drop_duplicates(subset=["SamAccountName"])
+        if len(scoped_pool) < 2:
+            return self._empty_similarity_recommendations()
+
+        model = SimilarityModel().fit(scoped_pool)
+        similar_users = model.similar_users(
+            sam_account_name=sam_account_name,
+            top_n=top_n_users,
+        )
+        if similar_users.empty:
+            return self._empty_similarity_recommendations()
+
+        users_by_id = scoped_pool.set_index("SamAccountName")
+        target_rights = set(filter_group_list(users_by_id.loc[sam_account_name, "GroupsList"]))
+        candidate_counts: dict[str, int] = {}
+        supporter_users: dict[str, list[str]] = {}
+
+        for similar_user in similar_users["SamAccountName"]:
+            rights = filter_group_list(users_by_id.loc[similar_user, "GroupsList"])
+            for right in rights:
+                if right in target_rights:
+                    continue
+                candidate_counts[right] = candidate_counts.get(right, 0) + 1
+                supporter_users.setdefault(right, []).append(str(similar_user))
+
+        rows: list[dict[str, object]] = []
+        for right, count in candidate_counts.items():
+            if count >= min_support:
+                rows.append(
+                    {
+                        "GroupName": right,
+                        "MLSupportCount": count,
+                        "MLComparedUsers": len(similar_users),
+                        "MLConfidence": count / len(similar_users),
+                        "NearestUsers": ", ".join(supporter_users.get(right, [])),
+                    }
+                )
+
+        if not rows:
+            return self._empty_similarity_recommendations()
+
+        out = filter_recommendations_df(pd.DataFrame(rows)).sort_values(
+            ["MLConfidence", "MLSupportCount"],
+            ascending=False,
+        )
+        out["MLMode"] = ml_mode
+        out["MLAnchorNetID"] = ml_anchor_netid
+        out["MLWorkforcePoolFallback"] = pool_wf_fallback
+        return out
+
+    def recommend_for_similarity_pool(
+        self,
+        sam_account_name: str,
+        pool: pd.DataFrame,
+        *,
+        top_n_users: int = 5,
+        min_support: int = 3,
+        pool_wf_fallback: bool = False,
+        ml_mode: str = "ad_cohort",
+        ml_anchor_netid: str | None = None,
+    ) -> pd.DataFrame:
+        return self._recommend_similarity_within_pool(
+            sam_account_name=sam_account_name,
+            pool=pool,
+            top_n_users=top_n_users,
+            min_support=min_support,
+            pool_wf_fallback=pool_wf_fallback,
+            ml_mode=ml_mode,
+            ml_anchor_netid=ml_anchor_netid or sam_account_name,
+        )
+
     def recommend_for_user(
         self,
         sam_account_name: str,
@@ -204,53 +322,15 @@ class MLRecommender:
             workforce_segment=workforce_segment,
         )
 
-        pool = pd.concat([pool, target_user], ignore_index=True)
-        pool = pool.drop_duplicates(subset=["SamAccountName"])
-
-        if len(pool) < 2:
-            return pd.DataFrame()
-
-        model = SimilarityModel().fit(pool)
-
-        similar_users = model.similar_users(
+        return self._recommend_similarity_within_pool(
             sam_account_name=sam_account_name,
-            top_n=top_n_users,
+            pool=pool,
+            top_n_users=top_n_users,
+            min_support=min_support,
+            pool_wf_fallback=pool_wf_fallback,
+            ml_mode="target_user",
+            ml_anchor_netid=sam_account_name,
         )
-
-        users_by_id = pool.set_index("SamAccountName")
-
-        target_rights = set(filter_group_list(users_by_id.loc[sam_account_name, "GroupsList"]))
-
-        candidate_counts = {}
-
-        for similar_user in similar_users["SamAccountName"]:
-            rights = filter_group_list(users_by_id.loc[similar_user, "GroupsList"])
-
-            for right in rights:
-                if right not in target_rights:
-                    candidate_counts[right] = candidate_counts.get(right, 0) + 1
-
-        rows = []
-
-        for right, count in candidate_counts.items():
-            if count >= min_support:
-                rows.append({
-                    "GroupName": right,
-                    "MLSupportCount": count,
-                    "MLComparedUsers": len(similar_users),
-                    "MLConfidence": count / len(similar_users),
-                    "NearestUsers": ", ".join(similar_users["SamAccountName"]),
-                })
-
-        if not rows:
-            return pd.DataFrame()
-
-        out = filter_recommendations_df(pd.DataFrame(rows)).sort_values(
-            ["MLConfidence", "MLSupportCount"],
-            ascending=False,
-        )
-        out["MLWorkforcePoolFallback"] = pool_wf_fallback
-        return out
 
     def recommend_for_role_peers(
         self,

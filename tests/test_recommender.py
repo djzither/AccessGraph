@@ -135,6 +135,38 @@ def test_recommend_for_user_raises_for_missing_target():
         )
 
 
+def test_restrict_workforce_canonicalizes_segment_and_employee_type_labels():
+    df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": f"student{i}",
+                "Department": "CE IT",
+                "EmployeeType": "Student",
+                "GroupsList": ["VPN"],
+                "IsSupervisor": False,
+            }
+            for i in range(12)
+        ]
+        + [
+            {
+                "SamAccountName": f"staff{i}",
+                "Department": "CE IT",
+                "EmployeeType": "Full Time",
+                "GroupsList": ["VPN"],
+                "IsSupervisor": False,
+            }
+            for i in range(4)
+        ]
+    )
+    recommender = MLRecommender(df)
+
+    restricted, wf_fallback = recommender._restrict_workforce(df, "STUDENT")
+
+    assert wf_fallback is False
+    assert len(restricted) == 12
+    assert set(restricted["EmployeeType"]) == {"Student"}
+
+
 def test_recommend_for_peer_cohort_uses_all_users_in_selected_cohort():
     recommender = MLRecommender(make_recommender_df())
     cohort = pd.DataFrame(
