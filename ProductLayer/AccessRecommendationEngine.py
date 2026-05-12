@@ -177,6 +177,7 @@ class AccessRecommendationEngine:
             target_user_row=target_user_row,
             users_df=users_df,
         )
+        merged = self._apply_reference_governance_metadata(merged)
 
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
@@ -652,6 +653,41 @@ class AccessRecommendationEngine:
 
         return merged
 
+    @staticmethod
+    def _student_peer_support_count(row) -> int:
+        return int(
+            row.get("StudentPeerSupportCount", row.get("PeerStudentSupportCount", 0)) or 0
+        )
+
+    @classmethod
+    def _reference_support_count(cls, row) -> int:
+        if not bool(row.get("InReferenceSheet", False)):
+            return 0
+        count = int(row.get("ReferenceTemplateCount", 0) or 0)
+        return count if count > 0 else 1
+
+    @classmethod
+    def _student_reference_contamination_conflict(cls, row) -> bool:
+        if str(row.get("EmployeeTypeClean", "")).lower().strip() != "student":
+            return False
+        if not bool(row.get("InReferenceSheet", False)):
+            return False
+        return bool(row.get("SupervisorContaminationFlag", False))
+
+    def _apply_reference_governance_metadata(self, merged: pd.DataFrame) -> pd.DataFrame:
+        if merged.empty:
+            return merged
+
+        df = merged.copy()
+        for idx, row in df.iterrows():
+            df.at[idx, "ReferenceSupportCount"] = self._reference_support_count(row)
+            df.at[idx, "PeerStudentSupportCount"] = self._student_peer_support_count(row)
+            df.at[idx, "SupervisorSupportCount"] = int(row.get("SupervisorSupportCount", 0) or 0)
+            df.at[idx, "ReferenceContaminationConflict"] = (
+                self._student_reference_contamination_conflict(row)
+            )
+        return df
+
     def _score_row(self, row) -> float:
         score = 0
         employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
@@ -743,8 +779,14 @@ class AccessRecommendationEngine:
         ):
             score = max(score, 0.55)
 
+        # Reference templates may raise visibility, but contaminated student rows
+        # must not be promoted to Suggest/Strong Recommend on reference floors alone.
+        conflict = self._student_reference_contamination_conflict(row)
         if row["InReferenceSheet"] and not is_ambiguous_ref:
-            score = max(score, reference_weight)
+            if not conflict or peer_student_support >= 2:
+                score = max(score, reference_weight)
+        if conflict and peer_student_support < 2:
+            score = min(score, 0.49)
 
         if row["RiskLevel"] == "High" and not row["InReferenceSheet"]:
             score *= 0.5
@@ -755,29 +797,37 @@ class AccessRecommendationEngine:
         if row["RiskLevel"] == "High":
             return "Manual Review"
 
+        employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
+
+        # Reference-backed student rows still require student peer support when
+        # supervisor/full-time contamination is present.
+        if (
+            employee_type_clean == "student"
+            and self._student_reference_contamination_conflict(row)
+            and self._student_peer_support_count(row) < 2
+        ):
+            return "Manual Review"
+
         if bool(row.get("SupervisorContaminationFlag", False)):
-            employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
             if employee_type_clean == "student" and not bool(row.get("InReferenceSheet", False)):
                 return "Manual Review"
 
         if bool(row.get("AnchorMismatchFlag", False)):
-            employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
             if (
                 employee_type_clean == "student"
                 and row["CopyFromUserHasIt"]
                 and not bool(row.get("InReferenceSheet", False))
-                and int(row.get("StudentPeerSupportCount", row.get("PeerStudentSupportCount", 0)) or 0) < 2
+                and self._student_peer_support_count(row) < 2
             ):
                 return "Manual Review"
 
         score = row["FinalScore"]
 
         if score >= 0.85:
-            employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
             if employee_type_clean == "student" and (
                 bool(row.get("SupervisorContaminationFlag", False))
                 or bool(row.get("AnchorMismatchFlag", False))
-            ) and not bool(row.get("InReferenceSheet", False)):
+            ):
                 return "Manual Review"
             return "Auto Assign"
 
@@ -857,6 +907,12 @@ class AccessRecommendationEngine:
                 "peer evidence="
                 f"{int(row.get('PeerStudentSupportCount', 0))}; "
                 f"supervisor evidence={int(row.get('SupervisorSupportCount', 0))}"
+            )
+
+        if bool(row.get("ReferenceContaminationConflict", False)):
+            reasons.append(
+                "Reference template includes this access, but supporting peer evidence "
+                "comes primarily from supervisor/full-time users."
             )
 
         review_reason = str(row.get("ReviewReason", "")).strip()
