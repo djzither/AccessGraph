@@ -1,8 +1,12 @@
+import logging
+
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list, filter_recommendations_df, filter_user_groups_df
 from DataLayer.workforce_type import canonical_from_ui_label
 from MLLayer.similarity_model import SimilarityModel
+
+logger = logging.getLogger(__name__)
 
 
 class MLRecommender:
@@ -16,6 +20,12 @@ class MLRecommender:
     @staticmethod
     def _normalize_text(value: object) -> str:
         return str(value).lower().strip()
+
+    @staticmethod
+    def _canonical_workforce_segment(workforce_segment: str | None) -> str | None:
+        if workforce_segment is None:
+            return None
+        return canonical_from_ui_label(workforce_segment)
 
     def _role_title_department_pool(
         self,
@@ -89,12 +99,37 @@ class MLRecommender:
             or "EmployeeType" not in pool.columns
         ):
             return pool.copy(), False
-        strict = pool[pool["EmployeeType"] == workforce_segment].copy()
-        if len(strict) >= self.MIN_POOL_SIZE:
+
+        target_canonical = self._canonical_workforce_segment(workforce_segment)
+        pool_types = pool["EmployeeType"].dropna().astype(str).unique().tolist()
+        strict = pool[
+            pool["EmployeeType"].apply(canonical_from_ui_label) == target_canonical
+        ].copy()
+        matched_count = len(strict)
+        if matched_count >= self.MIN_POOL_SIZE:
+            logger.debug(
+                "ML workforce restriction applied: segment=%r canonical=%r "
+                "pool_types=%r matched=%d wf_fallback=False",
+                workforce_segment,
+                target_canonical,
+                pool_types,
+                matched_count,
+            )
             return strict, False
+
+        wf_fallback = True
+        logger.debug(
+            "ML workforce restriction fallback: segment=%r canonical=%r "
+            "pool_types=%r matched=%d pool_size=%d wf_fallback=True",
+            workforce_segment,
+            target_canonical,
+            pool_types,
+            matched_count,
+            len(pool),
+        )
         if strict.empty:
-            return pool.copy(), True
-        return pool.copy(), True
+            return pool.copy(), wf_fallback
+        return pool.copy(), wf_fallback
 
     def _similarity_pool_for_user(
         self,
@@ -291,14 +326,25 @@ class MLRecommender:
 
         role_peers = filter_user_groups_df(cohort_df)
         ml_wf_fb = bool(peer_aggregate_fallback)
+        target_canonical = self._canonical_workforce_segment(workforce_segment)
         if (
             not respect_anchor_pool
-            and workforce_segment is not None
+            and target_canonical is not None
             and "EmployeeType" in role_peers.columns
         ):
+            pool_types = role_peers["EmployeeType"].dropna().astype(str).unique().tolist()
             strict = role_peers[
-                role_peers["EmployeeType"].apply(canonical_from_ui_label) == workforce_segment
+                role_peers["EmployeeType"].apply(canonical_from_ui_label) == target_canonical
             ].copy()
+            logger.debug(
+                "ML peer cohort workforce filter: segment=%r canonical=%r "
+                "pool_types=%r matched=%d respect_anchor_pool=%s",
+                workforce_segment,
+                target_canonical,
+                pool_types,
+                len(strict),
+                respect_anchor_pool,
+            )
             if len(strict) >= 2:
                 role_peers = strict
             elif strict.empty and len(role_peers) > 0:
