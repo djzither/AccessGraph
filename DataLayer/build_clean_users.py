@@ -13,8 +13,7 @@ from DataLayer.access_exclusions import (
     is_excluded_permission,
 )
 from DataLayer.cleaner import DataCleaner
-from DataLayer.loader import DataLoader
-from DataLayer.permission_normalization import normalize_groups_input, summarize_column_values
+from DataLayer.permission_normalization import normalize_groups_input
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
 
 logger = logging.getLogger("accessgraph.permissions")
@@ -64,10 +63,12 @@ def build_clean_users(
     output_path: Path = DEFAULT_OUT,
     reference_output_path: Path = DEFAULT_REFERENCE_OUT,
 ) -> Path:
-    loader = DataLoader(str(raw_dir))
+    raw_path = raw_dir / raw_file
+    if not raw_path.exists():
+        raise FileNotFoundError(f"Raw AD export not found: {raw_path}")
     cleaner = DataCleaner(processed_path=str(output_path))
 
-    raw_df = loader.load_file(raw_file, sheet_name=0)
+    raw_df = pd.read_excel(raw_path, sheet_name=0)
     raw_rows = len(raw_df)
     if raw_rows == 0:
         raise ValueError("Raw AD export is empty. Refusing to write processed parquet.")
@@ -85,30 +86,15 @@ def build_clean_users(
             if is_excluded_permission(group)
         )
     )
-    perm_stats_raw = summarize_column_values(
-        raw_df["Groups"].tolist(),
-        context="build_clean_users.raw_AD_Groups",
-    )
+    cleaned = filter_user_groups_df(cleaned)
     groupslist_token_total = int(
         sum(len(x) for x in cleaned["GroupsList"] if isinstance(x, list))
     )
-    print(
-        "Permission normalization (raw AD Groups): "
-        f"raw_segments={perm_stats_raw.total_raw_segments:,} "
-        f"dropped_empty_invalid={perm_stats_raw.total_dropped:,} "
-        f"rows={perm_stats_raw.rows_processed:,}"
-    )
-    print(
-        "Permission tokens after AD cleaner rules (GroupsList): "
-        f"count={groupslist_token_total:,}"
-    )
     logger.info(
-        "build_clean_users raw_segments=%s dropped_invalid=%s groupslist_tokens=%s",
-        perm_stats_raw.total_raw_segments,
-        perm_stats_raw.total_dropped,
+        "build_clean_users groupslist_tokens=%s excluded_crm=%s",
         groupslist_token_total,
+        excluded_user_group_entries,
     )
-    cleaned = filter_user_groups_df(cleaned)
 
     cleaner.validate_required_columns(cleaned, REQUIRED_OUTPUT_COLUMNS)
 
@@ -169,13 +155,7 @@ def build_clean_users(
         "zero_group_users": zero_group_users,
         "zero_group_percentage": zero_group_pct,
         "schema_columns": list(cleaned.columns),
-        "permission_normalization": {
-            "raw_column": "Groups",
-            "raw_segments_total": perm_stats_raw.total_raw_segments,
-            "dropped_empty_invalid_total": perm_stats_raw.total_dropped,
-            "rows_processed": perm_stats_raw.rows_processed,
-            "groupslist_token_total_after_cleaner": groupslist_token_total,
-        },
+        "groupslist_token_total": groupslist_token_total,
         "employee_type_distribution": {
             str(k): int(v)
             for k, v in cleaned["EmployeeType"].value_counts().items()

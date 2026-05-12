@@ -330,12 +330,10 @@ class PeerPoolBuildResult:
             "AnchorUserType": self.anchor_user_type,
             "PeerPoolSize": self.peer_pool_size,
             "SupervisorUsersExcluded": ", ".join(self.supervisor_users_excluded),
-            "SupervisorsExcluded": ", ".join(self.supervisor_users_excluded),
             "OutlierUsersExcluded": ", ".join(self.outlier_users_excluded),
             "PeerPoolComposition": self.peer_pool_composition,
             "ReviewReason": self.review_reason,
             "PeerUsers": ", ".join(self.peer_users),
-            "PeerUsersUsed": ", ".join(self.peer_users),
             "TargetWorkforceType": self.target_workforce_type,
             "AnchorWorkforceType": self.anchor_workforce_type,
             "AnchorMismatchFlag": self.anchor_mismatch_flag,
@@ -609,7 +607,6 @@ class ContaminationStats:
     def as_row_metadata(self) -> dict[str, object]:
         return {
             "PeerStudentSupportCount": self.peer_student_support_count,
-            "StudentPeerSupportCount": self.peer_student_support_count,
             "SupervisorSupportCount": self.supervisor_support_count,
             "FullTimeSupportCount": self.full_time_support_count,
             "SameManagerPeerSupportCount": self.same_manager_peer_support_count,

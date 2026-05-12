@@ -5,7 +5,8 @@ Use `python -m DataLayer.build_clean_users` and parquet-based product flows inst
 
 from pathlib import Path
 
-from DataLayer.loader import DataLoader
+import pandas as pd
+
 from DataLayer.cleaner import DataCleaner
 from DeterministicLayer.rules_recommender import RulesRecommender
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
@@ -75,10 +76,9 @@ def main():
     base_dir = Path(__file__).resolve().parents[1]
     data_path = base_dir / "data" / "raw"
 
-    loader = DataLoader(base_path=data_path)
     cleaner = DataCleaner()
 
-    df = loader.load_file("ce_ad_user_rights_all.xlsx")
+    df = pd.read_excel(data_path / "ce_ad_user_rights_all.xlsx")
     df = cleaner.clean_groups(df)
 
     row = df.dropna(subset=["Title", "Department"]).iloc[0]

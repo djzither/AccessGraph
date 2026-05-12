@@ -167,11 +167,9 @@ class AccessRecommendationEngine:
             "AnchorUserType": "",
             "PeerPoolSize": len(comparison_cohort),
             "SupervisorUsersExcluded": "",
-            "SupervisorsExcluded": "",
             "OutlierUsersExcluded": "",
             "PeerPoolComposition": "",
             "PeerUsers": "",
-            "PeerUsersUsed": "",
             "TargetWorkforceType": "",
             "AnchorWorkforceType": "",
             "AnchorMismatchFlag": False,
@@ -921,9 +919,7 @@ class AccessRecommendationEngine:
 
     @staticmethod
     def _student_peer_support_count(row) -> int:
-        return int(
-            row.get("StudentPeerSupportCount", row.get("PeerStudentSupportCount", 0)) or 0
-        )
+        return int(row.get("PeerStudentSupportCount", 0) or 0)
 
     @classmethod
     def _reference_support_count(cls, row) -> int:
@@ -1030,9 +1026,7 @@ class AccessRecommendationEngine:
             if employee_type_clean == "student" and bool(row.get("SupervisorContaminationFlag", False)):
                 score = min(score, copy_weight + 0.05)
 
-        peer_student_support = int(
-            row.get("StudentPeerSupportCount", row.get("PeerStudentSupportCount", 0)) or 0
-        )
+        peer_student_support = int(row.get("PeerStudentSupportCount", 0) or 0)
         full_time_support = int(row.get("FullTimeSupportCount", 0) or 0)
         if employee_type_clean == "student" and full_time_support > peer_student_support:
             score = min(score, 0.45)

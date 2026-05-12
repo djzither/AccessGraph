@@ -12,7 +12,6 @@ from DataLayer.access_exclusions import (
     is_excluded_access,
     is_excluded_access_category,
 )
-from DataLayer.loader import DataLoader
 from DataLayer.permission_normalization import normalize_single_permission
 from DataLayer.workforce_type import canonical_from_reference_employee_type
 
@@ -113,7 +112,7 @@ class RightsSheetsLoader:
     }
 
     def __init__(self, raw_path: str | Path):
-        self.loader = DataLoader(base_path=str(raw_path))
+        self.raw_path = Path(raw_path)
         self.validation: list[dict] = []
 
     def load_reference_sheets(self) -> pd.DataFrame:
@@ -135,7 +134,9 @@ class RightsSheetsLoader:
         return combined
 
     def _load_and_normalize(self, file_name: str, employee_type: str | None = None) -> pd.DataFrame:
-        path = self.loader._get_path(file_name)
+        path = self.raw_path / file_name
+        if not path.exists():
+            raise FileNotFoundError(f"Reference file not found: {path}")
         config = self.FILE_CONFIG.get(Path(file_name).stem, {})
         employee_type = employee_type or config.get("employee_type") or self._employee_type_from_name(file_name)
         preferred_sheet = config.get("sheet")
@@ -413,17 +414,16 @@ class RightsSheetsLoader:
         department: str | None,
         supervisor: str | None,
         access_category: str | None,
-        access_name: str,
+        access_name: str,  # already normalized by _split_access_items
         source_file: str,
     ) -> dict:
-        access_norm = normalize_single_permission(access_name) or ""
         return {
             "EmployeeType": employee_type,
             "JobTitle": job_title,
             "Department": department,
             "Supervisor": supervisor,
             "AccessCategory": access_category,
-            "AccessName": access_norm,
+            "AccessName": access_name,
             "SourceFile": source_file,
         }
 
