@@ -283,6 +283,7 @@ class MLRecommender:
         min_support: int = 2,
         workforce_segment: str | None = None,
         peer_aggregate_fallback: bool = False,
+        respect_anchor_pool: bool = False,
     ) -> pd.DataFrame:
 
         if cohort_df.empty:
@@ -290,7 +291,11 @@ class MLRecommender:
 
         role_peers = filter_user_groups_df(cohort_df)
         ml_wf_fb = bool(peer_aggregate_fallback)
-        if workforce_segment is not None and "EmployeeType" in role_peers.columns:
+        if (
+            not respect_anchor_pool
+            and workforce_segment is not None
+            and "EmployeeType" in role_peers.columns
+        ):
             strict = role_peers[
                 role_peers["EmployeeType"].apply(canonical_from_ui_label) == workforce_segment
             ].copy()
