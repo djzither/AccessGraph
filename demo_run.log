@@ -1,0 +1,34 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "C:\Users\djzit\PycharmProjects\AccessGraph\scripts\build_demo_dataset.py", line 869, in <module>
+    sys.exit(main())
+             ^^^^^^
+  File "C:\Users\djzit\PycharmProjects\AccessGraph\scripts\build_demo_dataset.py", line 857, in main
+    ok = build_demo_dataset(
+         ^^^^^^^^^^^^^^^^^^^
+  File "C:\Users\djzit\PycharmProjects\AccessGraph\scripts\build_demo_dataset.py", line 845, in build_demo_dataset
+    ok = validate(
+         ^^^^^^^^^
+  File "C:\Users\djzit\PycharmProjects\AccessGraph\scripts\build_demo_dataset.py", line 495, in validate
+    _print_section("Row counts")
+  File "C:\Users\djzit\PycharmProjects\AccessGraph\scripts\build_demo_dataset.py", line 447, in _print_section
+    print(f"\n{bar}\n {title}\n{bar}")
+  File "C:\Python312\Lib\encodings\cp1252.py", line 19, in encode
+    return codecs.charmap_encode(input,self.errors,encoding_table)[0]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+UnicodeEncodeError: 'charmap' codec can't encode characters in position 2-13: character maps to <undefined>
+[load] users:     data\processed\clean_users.parquet
+[load] reference: data\processed\access_reference.parquet
+  users rows:     3,999
+  reference rows: 4,897
+[sanitize] transforming users…
+[sanitize] transforming reference…
+[write] data\demo_processed\sanitized_clean_users.parquet
+[write] data\demo_processed\sanitized_access_reference.parquet
+[write] mapping CSVs in private\demo_mapping
+  user_map: private\demo_mapping\user_map.csv
+  person_name_map: private\demo_mapping\person_name_map.csv
+  title_map: private\demo_mapping\title_map.csv
+  department_map: private\demo_mapping\department_map.csv
+  permission_map: private\demo_mapping\permission_map.csv

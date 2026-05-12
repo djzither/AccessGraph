@@ -140,6 +140,9 @@ class AccessRecommendationEngine:
         merged["CohortWorkforceTarget"] = wattrs.get("workforce_target", target_canonical)
         merged["CohortWorkforceFallback"] = bool(wattrs.get("workforce_fallback", False))
         merged["CohortEmployeeTypeMix"] = mix_str
+        merged["CohortFallbackLevel"] = wattrs.get("cohort_fallback_level", "")
+        merged["CohortUsedForScoring"] = wattrs.get("cohort_used_for_scoring", "")
+        merged["CohortUsedMix"] = mix_str
         merged["IsFSYRole"] = self._is_fsy_role(title=title, department=department)
         merged["CohortSize"] = len(comparison_cohort)
         merged["CohortReliability"] = min(1.0, len(comparison_cohort) / self.MIN_RELIABLE_COHORT)
@@ -149,9 +152,19 @@ class AccessRecommendationEngine:
             "AnchorUserType": "",
             "PeerPoolSize": len(comparison_cohort),
             "SupervisorUsersExcluded": "",
+            "SupervisorsExcluded": "",
             "OutlierUsersExcluded": "",
             "PeerPoolComposition": "",
             "PeerUsers": "",
+            "PeerUsersUsed": "",
+            "TargetWorkforceType": "",
+            "AnchorWorkforceType": "",
+            "AnchorMismatchFlag": False,
+            "ManagerNetId": "",
+            "FullTimeExcludedForStudentTarget": "",
+            "StudentsExcludedForFullTimeTarget": "",
+            "ManagerOfOthersExcluded": "",
+            "FallbackReason": "",
         }.items():
             merged[meta_key] = peer_pool_metadata.get(meta_key, default)
 
@@ -162,6 +175,7 @@ class AccessRecommendationEngine:
             comparison_cohort=comparison_cohort,
             peer_pool_metadata=peer_pool_metadata,
             target_user_row=target_user_row,
+            users_df=users_df,
         )
 
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
@@ -446,6 +460,9 @@ class AccessRecommendationEngine:
                 peer_aggregate_fallback=getattr(comparison_cohort, "attrs", {}).get(
                     "workforce_fallback", False
                 ),
+                respect_anchor_pool=getattr(comparison_cohort, "attrs", {}).get(
+                    "peer_pool_locked", False
+                ),
             )
             ml_mode = "peer_aggregate"
             ml_anchor_netid = ""
@@ -559,7 +576,7 @@ class AccessRecommendationEngine:
         base = pd.DataFrame({
             "GroupNameClean": pd.Series(sorted(all_group_names), dtype="object")
         })
-        base = _ensure_group_key_dtype(base)
+        base["GroupNameClean"] = base["GroupNameClean"].fillna("").astype(str)
 
         merged = base.merge(reference_recs, on="GroupNameClean", how="left")
         merged = merged.merge(ad_recs, on="GroupNameClean", how="left", suffixes=("", "_AD"))
@@ -667,7 +684,8 @@ class AccessRecommendationEngine:
             score += reference_weight * 0.5
 
         cohort_reliability = float(row.get("CohortReliability", 0.0))
-        if row["InReferenceSheet"] or row["CopyFromUserHasIt"]:
+        copy_anchor = row["CopyFromUserHasIt"] and not bool(row.get("AnchorMismatchFlag", False))
+        if row["InReferenceSheet"] or copy_anchor:
             cohort_reliability = max(cohort_reliability, 0.8)
         else:
             cohort_reliability = max(cohort_reliability, 0.5)
@@ -680,6 +698,8 @@ class AccessRecommendationEngine:
         contamination_penalty = 0.35 if bool(row.get("SupervisorContaminationFlag", False)) else 1.0
         if contamination_penalty < 1.0 and employee_type_clean == "student":
             workforce_penalty *= contamination_penalty
+        if bool(row.get("AnchorMismatchFlag", False)) and employee_type_clean == "student":
+            workforce_penalty *= 0.5
         ad_signal = (
             float(row["ADConfidence"]) * cohort_reliability * commonality_penalty * workforce_penalty
         )
@@ -703,16 +723,23 @@ class AccessRecommendationEngine:
             score += ml_weights[2]
 
         if row["CopyFromUserHasIt"]:
-            score += copy_weight
+            if not bool(row.get("AnchorMismatchFlag", False)):
+                score += copy_weight
             if employee_type_clean == "student" and bool(row.get("SupervisorContaminationFlag", False)):
                 score = min(score, copy_weight + 0.05)
 
-        peer_student_support = int(row.get("PeerStudentSupportCount", 0) or 0)
+        peer_student_support = int(
+            row.get("StudentPeerSupportCount", row.get("PeerStudentSupportCount", 0)) or 0
+        )
+        full_time_support = int(row.get("FullTimeSupportCount", 0) or 0)
+        if employee_type_clean == "student" and full_time_support > peer_student_support:
+            score = min(score, 0.45)
         if (
             employee_type_clean == "student"
             and peer_student_support >= 2
             and float(row["ADConfidence"]) >= 0.99
             and not bool(row.get("SupervisorContaminationFlag", False))
+            and not bool(row.get("AnchorMismatchFlag", False))
         ):
             score = max(score, 0.55)
 
@@ -733,9 +760,25 @@ class AccessRecommendationEngine:
             if employee_type_clean == "student" and not bool(row.get("InReferenceSheet", False)):
                 return "Manual Review"
 
+        if bool(row.get("AnchorMismatchFlag", False)):
+            employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
+            if (
+                employee_type_clean == "student"
+                and row["CopyFromUserHasIt"]
+                and not bool(row.get("InReferenceSheet", False))
+                and int(row.get("StudentPeerSupportCount", row.get("PeerStudentSupportCount", 0)) or 0) < 2
+            ):
+                return "Manual Review"
+
         score = row["FinalScore"]
 
         if score >= 0.85:
+            employee_type_clean = str(row.get("EmployeeTypeClean", "")).lower().strip()
+            if employee_type_clean == "student" and (
+                bool(row.get("SupervisorContaminationFlag", False))
+                or bool(row.get("AnchorMismatchFlag", False))
+            ) and not bool(row.get("InReferenceSheet", False)):
+                return "Manual Review"
             return "Auto Assign"
 
         if score >= 0.70:
@@ -929,19 +972,24 @@ class AccessRecommendationEngine:
         comparison_cohort: pd.DataFrame,
         peer_pool_metadata: dict[str, object],
         target_user_row: dict[str, object],
+        users_df: pd.DataFrame,
     ) -> pd.DataFrame:
         if merged.empty:
             return merged
 
         df = merged.copy()
         target_is_student = str(target_user_row.get("EmployeeType", "")).lower().strip() == "student"
+        anchor_mismatch = bool(peer_pool_metadata.get("AnchorMismatchFlag", False))
         for idx, row in df.iterrows():
             stats = contamination_stats_for_group(
                 comparison_cohort,
                 str(row["GroupName"]),
                 normalizer=self._normalize_group_name,
+                target_row=target_user_row,
+                users_df=users_df,
             )
             row_meta = stats.as_row_metadata()
+            row_meta["AnchorMismatchFlag"] = anchor_mismatch
             if not target_is_student:
                 row_meta["SupervisorContaminationFlag"] = False
                 row_meta["ReviewReason"] = ""
@@ -952,6 +1000,22 @@ class AccessRecommendationEngine:
             if key not in df.columns:
                 df[key] = value
         return df
+
+    @staticmethod
+    def _stamp_cohort_diagnostics(
+        cohort: pd.DataFrame,
+        *,
+        fallback_level: object,
+        used_for_scoring: str,
+    ) -> pd.DataFrame:
+        attrs = {
+            **(getattr(cohort, "attrs", None) or {}),
+            "cohort_fallback_level": fallback_level,
+            "cohort_used_for_scoring": used_for_scoring,
+        }
+        stamped = cohort.copy()
+        stamped.attrs = attrs
+        return stamped
 
     def _select_ad_comparison_cohort(
         self,
@@ -1014,8 +1078,15 @@ class AccessRecommendationEngine:
                             reference_group_names,
                             title_clean,
                         )
-                        refined_anchor.attrs = getattr(anchor_workforce, "attrs", {}).copy()
-                        return refined_anchor
+                        refined_anchor.attrs = {
+                            **getattr(anchor_workforce, "attrs", {}),
+                            "peer_pool_locked": True,
+                        }
+                        return self._stamp_cohort_diagnostics(
+                            refined_anchor,
+                            fallback_level=0,
+                            used_for_scoring="anchor_peer_pool",
+                        )
 
         # Level 1: exact title + department
         exact_cohort = users[
@@ -1028,7 +1099,11 @@ class AccessRecommendationEngine:
                 exact_workforce, reference_group_names, title_clean
             )
             refined.attrs = getattr(exact_workforce, "attrs", {}).copy()
-            return refined
+            return self._stamp_cohort_diagnostics(
+                refined,
+                fallback_level=1,
+                used_for_scoring="title_department",
+            )
 
         # Level 2: department-only (copy-from fallback when dept not found)
         same_department = users[users["DepartmentClean"] == department_clean].copy()
@@ -1044,7 +1119,11 @@ class AccessRecommendationEngine:
         )
         if len(same_department) >= self.MIN_COHORT_SIZE or len(refined_same_department) >= 3:
             refined_same_department.attrs = getattr(dept_workforce, "attrs", {}).copy()
-            return refined_same_department
+            return self._stamp_cohort_diagnostics(
+                refined_same_department,
+                fallback_level=2,
+                used_for_scoring="department",
+            )
 
         # Level 3: title cross-department
         cross_dept = users[users["TitleClean"] == title_clean].copy()
@@ -1054,7 +1133,11 @@ class AccessRecommendationEngine:
                 cross_workforce, reference_group_names, title_clean
             )
             refined_cross.attrs = getattr(cross_workforce, "attrs", {}).copy()
-            return refined_cross
+            return self._stamp_cohort_diagnostics(
+                refined_cross,
+                fallback_level=3,
+                used_for_scoring="title_cross_department",
+            )
 
         # Level 4: return the largest non-empty candidate we found
         wf_exact = self._cohort_with_workforce(exact_cohort, target_canonical)
@@ -1063,10 +1146,18 @@ class AccessRecommendationEngine:
         candidates = [c for c in [wf_exact, wf_dept, wf_cross] if not c.empty]
         if candidates:
             best = max(candidates, key=len)
-            return best
+            return self._stamp_cohort_diagnostics(
+                best,
+                fallback_level=4,
+                used_for_scoring="best_available",
+            )
         out = exact_cohort.copy()
         out.attrs = getattr(wf_exact, "attrs", {}).copy()
-        return out
+        return self._stamp_cohort_diagnostics(
+            out,
+            fallback_level=4,
+            used_for_scoring="title_department_empty",
+        )
 
     def _compute_global_group_rates(self, users: pd.DataFrame) -> dict[str, float]:
         if users.empty:
