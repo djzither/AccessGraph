@@ -8,7 +8,7 @@ from typing import Any
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list
-from DataLayer.workforce_type import FULL_TIME, STUDENT, canonical_from_ui_label
+from DataLayer.workforce_type import FULL_TIME, STUDENT, UNKNOWN, canonical_from_ui_label
 
 DEFAULT_SUPERVISOR_TITLE_KEYWORDS: tuple[str, ...] = (
     "manager",
@@ -126,11 +126,16 @@ def infer_workforce_type(row: Any) -> str:
 
 
 def _workforce_to_canonical(workforce_type: str) -> str:
+    """Convert peer-cohort workforce constants to canonical workforce_type values.
+
+    Returns UNKNOWN rather than silently defaulting to STUDENT when the type
+    cannot be resolved — callers that need a display value should handle this.
+    """
     if workforce_type == WORKFORCE_FULL_TIME:
         return FULL_TIME
     if workforce_type == WORKFORCE_STUDENT:
         return STUDENT
-    return STUDENT
+    return UNKNOWN
 
 
 def _row_value(row: Any, key: str, default: object = "") -> object:
@@ -514,23 +519,28 @@ def build_peer_pool_from_anchor(
 
     peer_users = peer_pool["SamAccountName"].astype(str).tolist() if "SamAccountName" in peer_pool.columns else []
     selected_netids = set(peer_users)
+
+    # Single pass over the full department scope to:
+    # (a) record workforce-type exclusions for department members not in the candidate pool
+    # (b) record supervisor exclusions for those same department members
+    # Previously two separate loops; merged here to avoid the duplicate iteration.
     department_scope = users[users["DepartmentClean"] == anchor_department_clean]
     for _, candidate in department_scope.iterrows():
         candidate_netid = str(candidate.get("SamAccountName", ""))
         if not candidate_netid or candidate_netid in selected_netids:
             continue
+
         candidate_workforce = infer_workforce_type(candidate)
+
+        # Track workforce-type exclusions (department members outside the selected pool)
         if target_workforce == WORKFORCE_STUDENT and candidate_workforce == WORKFORCE_FULL_TIME:
             if candidate_netid not in full_time_excluded:
                 full_time_excluded.append(candidate_netid)
-        if target_workforce == WORKFORCE_FULL_TIME and candidate_workforce == WORKFORCE_STUDENT:
+        elif target_workforce == WORKFORCE_FULL_TIME and candidate_workforce == WORKFORCE_STUDENT:
             if candidate_netid not in students_excluded:
                 students_excluded.append(candidate_netid)
 
-    for _, candidate in department_scope.iterrows():
-        candidate_netid = str(candidate.get("SamAccountName", ""))
-        if not candidate_netid or candidate_netid in selected_netids:
-            continue
+        # Track supervisor exclusions (skip those already classified in the selection pass)
         if candidate_netid in excluded_supervisors or candidate_netid in excluded_outliers:
             continue
 

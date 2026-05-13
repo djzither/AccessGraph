@@ -3,7 +3,7 @@ import logging
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list, filter_recommendations_df, filter_user_groups_df
-from DataLayer.workforce_type import canonical_from_ui_label
+from DataLayer.workforce_type import UNKNOWN, canonical_from_ui_label
 from MLLayer.similarity_model import SimilarityModel
 
 logger = logging.getLogger(__name__)
@@ -116,6 +116,14 @@ class MLRecommender:
             return pool.copy(), False
 
         target_canonical = self._canonical_workforce_segment(workforce_segment)
+
+        # If the segment string doesn't resolve to a known type, skip restriction
+        # entirely rather than silently matching nothing and falling back to full pool.
+        if target_canonical == UNKNOWN:
+            logger.debug(
+                "ML workforce restriction skipped: unrecognized segment=%r", workforce_segment
+            )
+            return pool.copy(), False
         pool_types = pool["EmployeeType"].dropna().astype(str).unique().tolist()
         strict = pool[
             pool["EmployeeType"].apply(canonical_from_ui_label) == target_canonical
@@ -410,6 +418,7 @@ class MLRecommender:
         if (
             not respect_anchor_pool
             and target_canonical is not None
+            and target_canonical != UNKNOWN
             and "EmployeeType" in role_peers.columns
         ):
             pool_types = role_peers["EmployeeType"].dropna().astype(str).unique().tolist()

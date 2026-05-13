@@ -163,24 +163,28 @@ def build_clean_users(
     }
     metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
 
-    print("AccessGraph clean-user build complete")
-    print(f"Raw rows: {raw_rows:,}")
-    print(f"Cleaned rows: {len(cleaned):,}")
-    print(f"Users: {users:,}")
-    print(f"Unique groups: {unique_groups:,}")
-    print(f"Zero-group users: {zero_group_users:,} ({zero_group_pct}%)")
-    print(f"Reference rows: {len(reference_df):,}")
-    print(f"Excluded CRM user group entries: {excluded_user_group_entries:,}")
-    print(f"Remaining CRM user group entries: {remaining_user_crm_entries:,}")
-    print(f"Remaining CRM reference rows: {remaining_reference_crm_rows:,}")
-    print(f"Wrote: {output_path}")
-    print(f"Reference: {reference_output_path}")
-    print(f"Metadata: {metadata_path}")
+    logger.info(
+        "build_clean_users complete: raw=%s cleaned=%s users=%s unique_groups=%s "
+        "zero_group_users=%s (%s%%) reference_rows=%s excluded_crm=%s "
+        "remaining_crm_users=%s remaining_crm_ref=%s wrote=%s",
+        raw_rows,
+        len(cleaned),
+        users,
+        unique_groups,
+        zero_group_users,
+        zero_group_pct,
+        len(reference_df),
+        excluded_user_group_entries,
+        remaining_user_crm_entries,
+        remaining_reference_crm_rows,
+        output_path,
+    )
 
     return output_path
 
 
 def main() -> None:
+    logging.basicConfig(level=logging.INFO, format="%(message)s")
     parser = argparse.ArgumentParser(description="Build data/processed/clean_users.parquet from raw AD export.")
     parser.add_argument("--raw-dir", default=str(DEFAULT_RAW_DIR), help="Directory containing raw AD export.")
     parser.add_argument("--raw-file", default=DEFAULT_RAW_FILE, help="Raw AD export filename.")

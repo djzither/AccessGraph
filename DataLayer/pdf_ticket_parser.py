@@ -417,12 +417,12 @@ def parse_pdf_to_records(
     pdf_path: Path,
     *,
     extract_text_fn: Callable[[Path], str] | None = None,
-) -> dict[str, Any]:
+) -> list[dict[str, Any]]:
     """
     Full parse pipeline for one file: extract → clean → blocks → record dicts.
 
-    Returns a structure suitable for ``build_ticket_dataframe`` (list under key
-    ``records`` — single-element wrapper for clarity at call sites).
+    Returns the list of record dicts directly. Each dict contains the parsed
+    ticket fields plus ``raw_text`` and ``source_pdf`` for provenance.
     """
     extract_text_fn = extract_text_fn or extract_pdf_text
     raw_text = extract_text_fn(pdf_path)
@@ -434,7 +434,7 @@ def parse_pdf_to_records(
         rec["raw_text"] = raw_text
         rec["source_pdf"] = str(pdf_path.as_posix())
         records.append(rec)
-    return {"records": records, "cleaned_text": cleaned}
+    return records
 
 
 def load_demo_mapping_tables(
@@ -583,7 +583,7 @@ def build_ticket_dataframe(
 
     for path in paths:
         try:
-            bundle = parse_pdf_to_records(path, extract_text_fn=extract_text_fn)
+            records = parse_pdf_to_records(path, extract_text_fn=extract_text_fn)
         except PDFExtractionError as exc:
             logger.warning("Failed to read PDF %s: %s", path, exc)
             rows.append(
@@ -608,7 +608,7 @@ def build_ticket_dataframe(
             )
             continue
 
-        for rec in bundle["records"]:
+        for rec in records:
             id_map = resolve_demo_identity(rec, demo_users=demo_users, user_map=user_map, person_map=person_map)
             merged = {**rec, **id_map}
             rows.append(merged)
@@ -700,13 +700,15 @@ def analyze_demo_tickets_for_access_signals(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def log_validation_summary(stats: dict[str, Any]) -> None:
-    logger.info("Demo PDF ticket validation: %s", stats)
-    print("[validation] tickets_total:", stats.get("tickets_total"))
-    print("[validation] parsed_successfully:", stats.get("parsed_successfully"))
-    print("[validation] parse_failed:", stats.get("parse_failed"))
-    print("[validation] missing_critical_fields:", stats.get("missing_critical_fields"))
     dup = stats.get("duplicate_ticket_numbers") or []
-    print("[validation] duplicate_ticket_numbers:", dup if dup else "(none)")
+    logger.info(
+        "Demo PDF ticket validation — total=%s ok=%s failed=%s missing_critical=%s duplicates=%s",
+        stats.get("tickets_total"),
+        stats.get("parsed_successfully"),
+        stats.get("parse_failed"),
+        stats.get("missing_critical_fields"),
+        dup if dup else "(none)",
+    )
 
 
 def analyze_demo_tickets_example_report(df: pd.DataFrame) -> None:

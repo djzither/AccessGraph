@@ -6,6 +6,10 @@ Canonical values are stable for parquet and engine logic; UI and spreadsheets ma
 
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+
 # Only org-specific permission used for classification (presence in normalized AD groups).
 FULL_TIME_STAFF_AD_GROUP = "a.FULL TIME STAFF"
 
@@ -24,13 +28,19 @@ def classify_from_normalized_groups(groups: list[str]) -> str:
 
 
 def canonical_from_ui_label(label: object) -> str:
-    """Map Streamlit / API labels to canonical workforce segment."""
+    """Map Streamlit / API labels to canonical workforce segment.
+
+    Returns UNKNOWN for any label that does not resolve to a known type.
+    Callers that need a fallback default must handle UNKNOWN explicitly —
+    this function intentionally does not silently widen cohorts.
+    """
     text = "" if label is None else str(label).strip().lower()
     if text in {"full time", "fulltime", "full_time", "staff", "fte"}:
         return FULL_TIME
     if text in {"student", "stu"}:
         return STUDENT
-    return STUDENT
+    logger.debug("canonical_from_ui_label: unrecognized label=%r", label)
+    return UNKNOWN
 
 
 def canonical_from_reference_employee_type(value: object) -> str:

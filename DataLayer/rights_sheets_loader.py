@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 import re
 import warnings
 
 import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from DataLayer.access_exclusions import (
     count_excluded_reference_rows,
@@ -124,13 +127,12 @@ class RightsSheetsLoader:
         excluded = count_excluded_reference_rows(combined)
         combined = filter_reference_df(self._finalize_output(combined))
 
-        print(f"[reference] Final combined row count: {len(combined)}")
-        print(f"[reference] Excluded CRM rows: {excluded}")
+        logger.debug("reference combined row count=%s excluded_crm=%s", len(combined), excluded)
         if not combined.empty:
-            print("[reference] Row count by source file:")
-            print(combined["SourceFile"].value_counts().to_string())
-            print("[reference] Sample parsed rows:")
-            print(combined.head(5).to_string(index=False))
+            logger.debug(
+                "reference row count by source:\n%s",
+                combined["SourceFile"].value_counts().to_string(),
+            )
         return combined
 
     def _load_and_normalize(self, file_name: str, employee_type: str | None = None) -> pd.DataFrame:
@@ -387,16 +389,12 @@ class RightsSheetsLoader:
         }
         self.validation.append(info)
 
-        print(f"[{file_name}] Sheet: {sheet_name}")
-        print(f"[{file_name}] Detected header row: {header_row}")
-        print(f"[{file_name}] Parsed row count: {row_count}")
-        print(f"[{file_name}] Excluded CRM rows: {excluded_rows}")
-        print(f"[{file_name}] Missing/unmapped columns: missing={missing}; unmapped={unmapped}")
-        if sample.empty:
-            print(f"[{file_name}] Sample parsed rows: <none>")
-        else:
-            print(f"[{file_name}] Sample parsed rows:")
-            print(sample.to_string(index=False))
+        logger.debug(
+            "[%s] sheet=%s header_row=%s rows=%s excluded_crm=%s missing=%s unmapped=%s",
+            file_name, sheet_name, header_row, row_count, excluded_rows, missing, unmapped,
+        )
+        if not sample.empty:
+            logger.debug("[%s] sample rows:\n%s", file_name, sample.to_string(index=False))
 
         if empty_ratio > 0.5:
             message = (
