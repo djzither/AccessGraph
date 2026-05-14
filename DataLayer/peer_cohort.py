@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections import Counter
 from dataclasses import dataclass, field
@@ -8,7 +9,10 @@ from typing import Any
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list
+from DataLayer.permission_normalization import normalize_groups_input
 from DataLayer.workforce_type import FULL_TIME, STUDENT, UNKNOWN, canonical_from_ui_label
+
+logger = logging.getLogger(__name__)
 
 DEFAULT_SUPERVISOR_TITLE_KEYWORDS: tuple[str, ...] = (
     "manager",
@@ -63,25 +67,15 @@ def parse_manager_netid(manager_dn: object) -> str | None:
 
 
 def normalize_groups(groups: object) -> list[str]:
-    if groups is None:
-        return []
-    if isinstance(groups, list):
-        return filter_group_list(groups)
+    """Expand GroupsList cells to permission strings (delegates to normalize_groups_input).
 
-    values: list[str] = []
-    if isinstance(groups, str):
-        values = [part.strip() for part in groups.split(";")]
-    else:
-        values = [str(groups).strip()]
-
+    Handles numpy.ndarray / pandas Series values without stringifying the whole array,
+    which previously produced a single pseudo-token and broke supervisor heuristics.
+    """
     cleaned: list[str] = []
-    for value in values:
-        if not value:
-            continue
+    for value in normalize_groups_input(groups):
         lowered = value.lower()
         if any(fragment in lowered for fragment in INVALID_GROUP_FRAGMENTS):
-            continue
-        if lowered in {"", "nan", "none"}:
             continue
         cleaned.append(value)
     return filter_group_list(cleaned)
@@ -180,10 +174,23 @@ def _title_matches_keywords(title: str, keywords: tuple[str, ...]) -> bool:
     return False
 
 
+def _sensitive_keyword_match(lowered: str, keyword: str) -> bool:
+    """True when ``keyword`` appears as its own token, not as a substring (e.g. *admin* in *DomainAdmins*)."""
+    if not keyword:
+        return False
+    for m in re.finditer(re.escape(keyword), lowered):
+        i, j = m.span()
+        before = lowered[i - 1] if i > 0 else " "
+        after = lowered[j] if j < len(lowered) else " "
+        if not before.isalnum() and not after.isalnum():
+            return True
+    return False
+
+
 def _owns_sensitive_groups(row: Any) -> bool:
     for group in _groups_from_row(row):
         lowered = str(group).lower()
-        if any(keyword in lowered for keyword in SENSITIVE_GROUP_KEYWORDS):
+        if any(_sensitive_keyword_match(lowered, keyword) for keyword in SENSITIVE_GROUP_KEYWORDS):
             return True
     return False
 
@@ -227,29 +234,44 @@ def is_supervisor_like(
     title_keywords: tuple[str, ...] = DEFAULT_SUPERVISOR_TITLE_KEYWORDS,
     cohort_median_group_count: float | None = None,
     target_workforce_type: str | None = None,
+    decision_notes: list[str] | None = None,
 ) -> bool:
+    def _note(msg: str) -> None:
+        if decision_notes is not None:
+            decision_notes.append(msg)
+
     if _truthy_flag(_row_value(row, "IsSupervisor", False)):
+        _note("matched:IsSupervisor_column_truthy")
         return True
 
     title = _normalize_text(_row_value(row, "Title", ""))
     if _title_matches_keywords(title, title_keywords):
+        _note("matched:title_supervisor_keywords")
         return True
 
     candidate_netid = _candidate_netid(row)
     if users_df is not None and candidate_netid and is_manager_of_others(users_df, candidate_netid):
+        _note("matched:manager_of_others_graph")
         return True
 
     if target_workforce_type == WORKFORCE_STUDENT and _has_staff_group(row):
+        _note("matched:student_target_with_full_time_staff_group")
         return True
 
     group_count = _permission_count(row)
     if cohort_median_group_count is not None and cohort_median_group_count > 0:
         if group_count >= max(cohort_median_group_count * 1.75, cohort_median_group_count + 8):
+            _note(
+                "matched:permission_count_outlier_vs_cohort_median "
+                f"(count={group_count}, median={cohort_median_group_count})"
+            )
             return True
 
     if _owns_sensitive_groups(row):
+        _note("matched:sensitive_group_keyword_on_individual_groups")
         return True
 
+    _note("no_match:not_supervisor_like")
     return False
 
 
@@ -376,6 +398,11 @@ def _median_group_count(users_df: pd.DataFrame) -> float:
     return float(pd.Series(counts).median())
 
 
+def median_permission_count(users_df: pd.DataFrame) -> float:
+    """Median permission count per user row (for diagnostics; matches peer-pool cohort median)."""
+    return _median_group_count(users_df)
+
+
 def _manager_netid_for_row(row: Any) -> str:
     return parse_manager_netid(_row_value(row, "Manager", "")) or ""
 
@@ -452,21 +479,36 @@ def build_peer_pool_from_anchor(
     anchor_title_clean = _normalize_role_text(anchor_title)
     anchor_department_clean = _normalize_role_text(anchor_department)
 
+    filter_stages: list[dict[str, Any]] = []
+
+    def _filter_stage(name: str, frame: pd.DataFrame) -> None:
+        if not cohort_diagnostics:
+            return
+        netids: list[str] = []
+        if not frame.empty and "SamAccountName" in frame.columns:
+            netids = frame["SamAccountName"].astype(str).head(48).tolist()
+        filter_stages.append({"stage": name, "count": int(len(frame)), "sample_netids": netids})
+
+    _filter_stage("00_full_users_with_clean_columns", users)
+
     candidates = users[users["DepartmentClean"] == anchor_department_clean].copy()
     if candidates.empty:
         candidates = users.copy()
+    _filter_stage("01_after_department_scope", candidates)
 
     same_type = candidates[
         candidates.apply(lambda row: infer_workforce_type(row) == target_workforce, axis=1)
     ].copy()
     if same_type.empty:
         same_type = candidates
+    _filter_stage("02_after_workforce_alignment", same_type)
 
     title_scoped = same_type[same_type["TitleClean"] == anchor_title_clean]
     if not title_scoped.empty:
         candidates = title_scoped
     else:
         candidates = same_type
+    _filter_stage("03_pre_pairwise_selection", candidates)
 
     removals: list[dict[str, Any]] = []
     scoped_snapshots: list[dict[str, Any]] = []
@@ -479,6 +521,13 @@ def build_peer_pool_from_anchor(
             entry = peer_cohort_user_snapshot(row)
             entry["exclusion_rule"] = rule
             removals.append(entry)
+        logger.debug(
+            "peer_cohort removal: sam=%s rule=%s title=%r dept=%r",
+            str(row.get("SamAccountName", "")),
+            rule,
+            str(row.get("Title", "")),
+            str(row.get("Department", "")),
+        )
 
     selected_rows: list[pd.Series] = []
     excluded_supervisors: list[str] = []
@@ -493,6 +542,12 @@ def build_peer_pool_from_anchor(
         review_reasons.append(
             "Copy-from user workforce does not match student target; anchor evidence is review-only."
         )
+
+    logger.debug(
+        "peer_cohort filter_start: scoped_candidates=%s anchor=%s",
+        len(candidates),
+        anchor_netid,
+    )
 
     for _, candidate in candidates.iterrows():
         candidate_netid = str(candidate.get("SamAccountName", ""))
@@ -583,6 +638,13 @@ def build_peer_pool_from_anchor(
         else:
             peer_pool = peer_pool.drop(columns=["_ManagerNetId", "_SameManager"])
 
+    logger.debug(
+        "peer_cohort filter_end: final_peer_pool=%s anchor=%s",
+        len(peer_pool),
+        anchor_netid,
+    )
+    _filter_stage("04_after_pairwise_and_outlier_filters", peer_pool)
+
     peer_users = peer_pool["SamAccountName"].astype(str).tolist() if "SamAccountName" in peer_pool.columns else []
     selected_netids = set(peer_users)
 
@@ -666,6 +728,7 @@ def build_peer_pool_from_anchor(
             "removals": removals,
             "final_peer_count": int(len(peer_pool)),
             "final_peers": final_peers,
+            "filter_stages": filter_stages,
         }
 
     return PeerPoolBuildResult(

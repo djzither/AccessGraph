@@ -2,6 +2,7 @@ import pandas as pd
 import pytest
 
 from DataLayer.peer_cohort import (
+    _owns_sensitive_groups,
     build_peer_pool_from_anchor,
     build_target_user_row,
     contamination_stats_for_group,
@@ -35,6 +36,119 @@ def test_infer_workforce_type_from_groups_prefers_ad_markers():
 def test_normalize_groups_splits_and_filters_invalid_entries():
     groups = normalize_groups("Email; Cannot find an object with name 'x'; VPN")
     assert groups == ["Email", "VPN"]
+
+
+def test_normalize_groups_expands_numpy_array_to_distinct_strings():
+    import numpy as np
+
+    arr = np.array(
+        ["DCE.CMP.DomainAdmins", "DCE-LocalAdmin", "DCE-DomainUsers"],
+        dtype=object,
+    )
+    out = normalize_groups(arr)
+    assert out == [
+        "DCE.CMP.DomainAdmins",
+        "DCE-LocalAdmin",
+        "DCE-DomainUsers",
+    ]
+
+
+def test_normalize_groups_numpy_array_not_single_repr_blob():
+    import numpy as np
+
+    arr = np.array(["DCE.CMP.DomainAdmins", "DCE-DomainUsers"], dtype=object)
+    out = normalize_groups(arr)
+    assert len(out) == 2
+    assert not any("dtype=" in g for g in out)
+
+
+def test_owns_sensitive_groups_false_for_baseline_dce_groups():
+    row = {
+        "GroupsList": [
+            "DCE.CMP.DomainAdmins",
+            "DCE-LocalAdmin",
+            "DCE-DomainUsers",
+        ],
+    }
+    assert _owns_sensitive_groups(row) is False
+
+
+def test_owns_sensitive_groups_detects_standalone_sensitive_token():
+    row = {"GroupsList": ["Contoso-Privileged-Access"]}
+    assert _owns_sensitive_groups(row) is True
+
+
+def test_is_supervisor_like_still_true_for_manager_with_numpy_baseline_groups():
+    import numpy as np
+
+    users = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "mgr1",
+                "Title": "IT Manager",
+                "EmployeeType": "Full Time",
+                "GroupsList": np.array(
+                    ["DCE.CMP.DomainAdmins", "DCE-DomainUsers"],
+                    dtype=object,
+                ),
+                "IsSupervisor": False,
+            }
+        ]
+    )
+    row = users.iloc[0]
+    assert is_supervisor_like(row, users_df=users, cohort_median_group_count=5.0) is True
+
+
+def test_computing_specialist_peer_pool_not_collapsed_by_numpy_groupslist():
+    """Regression: ndarray GroupsList must not stringify to one blob (supervisor false positives)."""
+    import numpy as np
+
+    baseline = np.array(
+        ["DCE.CMP.DomainAdmins", "DCE-LocalAdmin", "DCE-DomainUsers"],
+        dtype=object,
+    )
+    users_df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "anchor1",
+                "DisplayName": "Anchor",
+                "Title": "Computing Specialist",
+                "Department": "Information Technology",
+                "EmployeeType": "Full Time",
+                "GroupsList": baseline,
+                "Manager": "",
+            },
+            {
+                "SamAccountName": "peer1",
+                "DisplayName": "Peer One",
+                "Title": "Computing Specialist",
+                "Department": "Information Technology",
+                "EmployeeType": "Full Time",
+                "GroupsList": baseline,
+                "Manager": "",
+            },
+            {
+                "SamAccountName": "peer2",
+                "DisplayName": "Peer Two",
+                "Title": "Computing Specialist",
+                "Department": "Information Technology",
+                "EmployeeType": "Full Time",
+                "GroupsList": baseline,
+                "Manager": "",
+            },
+        ]
+    )
+    anchor = users_df.iloc[0]
+    target = build_target_user_row(
+        title="Computing Specialist",
+        department="Information Technology",
+        employee_type="Full Time",
+    )
+    result = build_peer_pool_from_anchor(users_df, anchor, target)
+    assert result.peer_pool_size >= 2
+    peer_ids = set(result.peer_pool["SamAccountName"].astype(str))
+    assert "peer1" in peer_ids
+    assert "peer2" in peer_ids
 
 
 def test_is_supervisor_like_detects_title_and_manager_signals():

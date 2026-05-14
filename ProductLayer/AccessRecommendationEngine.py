@@ -21,6 +21,9 @@ from DataLayer.peer_cohort import (
     build_peer_pool_from_anchor,
     build_target_user_row,
     contamination_stats_for_group,
+    infer_workforce_type,
+    is_supervisor_like,
+    median_permission_count,
 )
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_labels import apply_access_pattern_columns
@@ -94,10 +97,13 @@ class AccessRecommendationEngine:
         copy_from_netid: str | None = None,
         new_hire_netid: str | None = None,
         cohort_diagnostics: bool = False,
+        recommendation_debug: bool = False,
     ) -> pd.DataFrame:
         users_df = filter_user_groups_df(users_df)
         reference_df = filter_reference_df(reference_df)
         target_canonical = canonical_from_ui_label(employee_type)
+
+        debug = bool(cohort_diagnostics or recommendation_debug)
 
         reference_recs = self._get_reference_recommendations(
             reference_df=reference_df,
@@ -107,6 +113,7 @@ class AccessRecommendationEngine:
             supervisor=supervisor,
             users_df=users_df,
             copy_from_netid=copy_from_netid,
+            reference_debug=debug,
         )
         reference_diagnostics = dict(reference_recs.attrs.get("reference_diagnostics", {}))
 
@@ -126,7 +133,7 @@ class AccessRecommendationEngine:
             copy_from_netid=copy_from_netid,
             target_user_row=target_user_row,
             peer_pool_metadata=peer_pool_metadata,
-            cohort_diagnostics=cohort_diagnostics,
+            cohort_diagnostics=debug,
         )
 
         ad_recs = self._get_ad_recommendations(
@@ -153,7 +160,31 @@ class AccessRecommendationEngine:
             copy_from_recs=copy_from_recs,
         )
         merged.attrs["reference_diagnostics"] = reference_diagnostics
-        if cohort_diagnostics:
+        if debug:
+            merged.attrs["cohort_filter_diagnostics"] = getattr(
+                comparison_cohort, "attrs", {}
+            ).get("cohort_filter_diagnostics")
+            med = median_permission_count(users_df)
+            audits: list[dict[str, object]] = []
+            if not comparison_cohort.empty:
+                for _, srow in comparison_cohort.iterrows():
+                    notes: list[str] = []
+                    is_supervisor_like(
+                        srow,
+                        users_df=users_df,
+                        cohort_median_group_count=med,
+                        target_workforce_type=infer_workforce_type(srow),
+                        decision_notes=notes,
+                    )
+                    audits.append(
+                        {
+                            "SamAccountName": str(srow.get("SamAccountName", "")),
+                            "decision_notes": list(notes),
+                        }
+                    )
+            merged.attrs["supervisor_decision_audits"] = audits
+            merged.attrs["recommendation_debug"] = True
+        elif cohort_diagnostics:
             merged.attrs["cohort_filter_diagnostics"] = getattr(
                 comparison_cohort, "attrs", {}
             ).get("cohort_filter_diagnostics")
@@ -230,6 +261,8 @@ class AccessRecommendationEngine:
         supervisor: str | None,
         users_df: pd.DataFrame,
         copy_from_netid: str | None,
+        *,
+        reference_debug: bool = False,
     ) -> pd.DataFrame:
 
         ref = reference_df.copy()
@@ -245,7 +278,7 @@ class AccessRecommendationEngine:
         ]
         if ref.empty:
             empty = pd.DataFrame(columns=empty_reference_columns)
-            empty.attrs["reference_diagnostics"] = {
+            rd: dict[str, object] = {
                 "reference_match_path": "no_reference_match",
                 "target_title": str(title).strip(),
                 "target_department": str(department).strip(),
@@ -256,6 +289,15 @@ class AccessRecommendationEngine:
                 "fallback_rows_after_department_guard": 0,
                 "fallback_empty_due_to_department_mismatch": False,
             }
+            if reference_debug:
+                rd["match_stages"] = {
+                    "raw_target": {
+                        "title": str(title).strip(),
+                        "department": str(department).strip(),
+                    },
+                    "reason": "reference_frame_empty_after_filters",
+                }
+            empty.attrs["reference_diagnostics"] = rd
             return empty
 
         for column, default in (
@@ -306,12 +348,49 @@ class AccessRecommendationEngine:
             "fallback_empty_due_to_department_mismatch": False,
         }
 
+        match_stages: dict[str, object] | None = {} if reference_debug else None
+
+        def _ref_stage(key: str, value: object) -> None:
+            if match_stages is not None:
+                match_stages[key] = value
+
+        if reference_debug:
+            _ref_stage(
+                "raw_target",
+                {
+                    "title": str(title).strip(),
+                    "department": str(department).strip(),
+                    "employee_type": None
+                    if employee_type is None
+                    else str(employee_type).strip(),
+                    "supervisor": None
+                    if supervisor is None
+                    else str(supervisor).strip(),
+                    "copy_from_netid": copy_from_netid,
+                },
+            )
+            _ref_stage(
+                "canonical_target",
+                {
+                    "role_candidates": sorted(
+                        [list(t) for t in role_candidates],
+                        key=lambda x: (x[0], x[1]),
+                    ),
+                    "employee_type_clean": employee_type_clean,
+                    "title_clean": title_clean_norm,
+                    "department_clean": dept_clean,
+                },
+            )
+            _ref_stage("reference_row_count_after_column_normalization", int(len(ref)))
+
         matched = ref[
             ref.apply(
                 lambda row: (row["JobTitleClean"], row["DepartmentClean"]) in role_candidates,
                 axis=1,
             )
         ].copy()
+        if reference_debug:
+            _ref_stage("candidate_rows_after_exact_title_department_join", int(len(matched)))
 
         if "EmployeeTypeClean" not in matched.columns:
             if "EmployeeType" in matched.columns:
@@ -321,6 +400,8 @@ class AccessRecommendationEngine:
 
         if employee_type_clean is not None:
             matched = matched[matched["EmployeeTypeClean"] == employee_type_clean].copy()
+        if reference_debug:
+            _ref_stage("candidate_rows_after_employee_type_filter", int(len(matched)))
 
         if not matched.empty:
             diag["reference_match_path"] = "exact_title_dept"
@@ -339,12 +420,17 @@ class AccessRecommendationEngine:
                     employee_ref["DepartmentClean"] == dept_clean
                 ].copy()
                 diag["fallback_rows_after_department_guard"] = int(len(dept_scoped))
+                if reference_debug:
+                    _ref_stage("fallback_employee_ref_row_count", int(len(employee_ref)))
+                    _ref_stage("fallback_dept_scoped_row_count", int(len(dept_scoped)))
 
                 if dept_scoped.empty:
                     diag["fallback_empty_due_to_department_mismatch"] = bool(len(employee_ref) > 0)
                     matched = ref.iloc[0:0].copy()
                 else:
                     candidate_titles = dept_scoped["JobTitle"].dropna().astype(str).unique().tolist()
+                    if reference_debug:
+                        _ref_stage("fallback_embed_candidate_title_values", list(candidate_titles))
                     embed_matcher = self.title_matcher
                     if embed_matcher is None:
                         try:
@@ -384,6 +470,8 @@ class AccessRecommendationEngine:
 
             if not supervisor_matches.empty:
                 matched = supervisor_matches
+        if reference_debug:
+            _ref_stage("candidate_rows_after_supervisor_narrowing_if_applicable", int(len(matched)))
 
         if employee_type_clean == "full time" and matched.empty and copy_from_netid is not None:
             copy_user = users_df[users_df["SamAccountName"] == copy_from_netid]
@@ -400,8 +488,15 @@ class AccessRecommendationEngine:
                     if not name_matches.empty:
                         matched = name_matches.copy()
                         diag["reference_match_path"] = "copy_from_reference_name"
+        if reference_debug:
+            _ref_stage("candidate_rows_after_copy_from_name_if_applicable", int(len(matched)))
 
         if matched.empty:
+            if match_stages is not None:
+                match_stages["final_matched_source_rows"] = 0
+                match_stages["final_matched_access_names"] = []
+                match_stages["final_recommended_group_name_clean"] = []
+                diag["match_stages"] = match_stages
             empty = pd.DataFrame(columns=[
                 "GroupNameClean",
                 "GroupName",
@@ -447,6 +542,16 @@ class AccessRecommendationEngine:
         grouped["InReferenceSheet"] = True
         grouped["ReferenceTemplateCount"] = template_count
         grouped["AmbiguousReferenceTemplate"] = ambiguous_template
+
+        if match_stages is not None:
+            match_stages["final_matched_source_rows"] = int(len(matched))
+            match_stages["final_matched_access_names"] = sorted(
+                matched["AccessName"].dropna().astype(str).unique().tolist()
+            )
+            match_stages["final_recommended_group_name_clean"] = sorted(
+                grouped["GroupNameClean"].astype(str).tolist()
+            )
+            diag["match_stages"] = match_stages
 
         grouped.attrs["reference_diagnostics"] = diag
         return grouped
