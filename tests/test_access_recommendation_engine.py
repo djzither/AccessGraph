@@ -13,6 +13,168 @@ class _StubTitleMatcher:
         return None, 0.2
 
 
+class _StubPrefersSupportTechnicianWhenPresent:
+    """Picks Support Technician if the embed pool includes it; else first candidate."""
+
+    def best_match(self, query_title, candidate_titles):
+        titles = list(candidate_titles)
+        for t in titles:
+            if str(t).strip().lower() == "support technician":
+                return t, 0.91
+        return (titles[0], 0.5) if titles else (None, 0.0)
+
+
+def test_computing_specialist_ce_it_help_desk_resolves_information_technology_reference():
+    users_df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "u1",
+                "DisplayName": "User One",
+                "Title": "Computing Specialist",
+                "Department": "CE IT Help Desk",
+                "GroupsList": ["IT.Template", "FS.Template"],
+            },
+        ]
+    )
+    reference_df = pd.DataFrame(
+        [
+            {
+                "EmployeeType": "Full Time",
+                "JobTitle": "Computing Specialist",
+                "Department": "Information Technology",
+                "Supervisor": None,
+                "AccessCategory": "AD Rights",
+                "AccessName": "IT.Template",
+                "SourceFile": "full_time_employee_access.xlsx",
+            },
+            {
+                "EmployeeType": "Full Time",
+                "JobTitle": "Accountant",
+                "Department": "Financial Services",
+                "Supervisor": None,
+                "AccessCategory": "AD Rights",
+                "AccessName": "FS.Template",
+                "SourceFile": "full_time_employee_access.xlsx",
+            },
+        ]
+    )
+    engine = AccessRecommendationEngine(min_confidence=0.4)
+    recs = engine.recommend_for_hire(
+        users_df=users_df,
+        reference_df=reference_df,
+        title="Computing Specialist",
+        department="CE IT Help Desk",
+        employee_type="Full Time",
+        supervisor=None,
+        copy_from_netid=None,
+        new_hire_netid=None,
+    )
+    by_group = recs.set_index("GroupName")
+    assert bool(by_group.loc["IT.Template", "InReferenceSheet"]) is True
+    assert bool(by_group.loc["FS.Template", "InReferenceSheet"]) is False
+
+
+def test_reference_embed_fallback_does_not_cross_departments():
+    users_df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "u1",
+                "DisplayName": "User One",
+                "Title": "Contract Analyst",
+                "Department": "Financial Services",
+                "GroupsList": ["IT.Template", "FS.Template"],
+            },
+        ]
+    )
+    reference_df = pd.DataFrame(
+        [
+            {
+                "EmployeeType": "Full Time",
+                "JobTitle": "Support Technician",
+                "Department": "Information Technology",
+                "Supervisor": None,
+                "AccessCategory": "AD Rights",
+                "AccessName": "IT.Template",
+                "SourceFile": "full_time_employee_access.xlsx",
+            },
+            {
+                "EmployeeType": "Full Time",
+                "JobTitle": "Legacy Analyst",
+                "Department": "Financial Services",
+                "Supervisor": None,
+                "AccessCategory": "AD Rights",
+                "AccessName": "FS.Template",
+                "SourceFile": "full_time_employee_access.xlsx",
+            },
+        ]
+    )
+    engine = AccessRecommendationEngine(
+        min_confidence=0.4,
+        title_matcher=_StubPrefersSupportTechnicianWhenPresent(),
+    )
+    recs = engine.recommend_for_hire(
+        users_df=users_df,
+        reference_df=reference_df,
+        title="Contract Analyst",
+        department="Financial Services",
+        employee_type="Full Time",
+        supervisor=None,
+        copy_from_netid=None,
+        new_hire_netid=None,
+    )
+    by_group = recs.set_index("GroupName")
+    assert bool(by_group.loc["FS.Template", "InReferenceSheet"]) is True
+    assert bool(by_group.loc["IT.Template", "InReferenceSheet"]) is False
+    diag = recs.attrs.get("reference_diagnostics", {})
+    assert diag.get("reference_match_path") == "fallback_title_same_department"
+
+
+def test_reference_fallback_empty_when_no_department_overlap():
+    users_df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "u1",
+                "DisplayName": "User One",
+                "Title": "Contract Analyst",
+                "Department": "Financial Services",
+                "GroupsList": ["IT.Template"],
+            },
+        ]
+    )
+    reference_df = pd.DataFrame(
+        [
+            {
+                "EmployeeType": "Full Time",
+                "JobTitle": "Support Technician",
+                "Department": "Information Technology",
+                "Supervisor": None,
+                "AccessCategory": "AD Rights",
+                "AccessName": "IT.Template",
+                "SourceFile": "full_time_employee_access.xlsx",
+            },
+        ]
+    )
+    engine = AccessRecommendationEngine(
+        min_confidence=0.4,
+        title_matcher=_StubPrefersSupportTechnicianWhenPresent(),
+    )
+    recs = engine.recommend_for_hire(
+        users_df=users_df,
+        reference_df=reference_df,
+        title="Contract Analyst",
+        department="Financial Services",
+        employee_type="Full Time",
+        supervisor=None,
+        copy_from_netid=None,
+        new_hire_netid=None,
+    )
+    row = recs.set_index("GroupName").loc["IT.Template"]
+    assert bool(row["InReferenceSheet"]) is False
+    diag = recs.attrs.get("reference_diagnostics", {})
+    assert diag.get("reference_match_path") == "no_reference_match"
+    assert diag.get("fallback_empty_due_to_department_mismatch") is True
+
+
 def test_recommend_for_hire_matches_reference_aliases_and_normalized_group_names():
     users_df = pd.DataFrame(
         [
@@ -177,7 +339,7 @@ def test_recommend_for_hire_uses_same_department_reference_overlap_for_ad_cohort
             {
                 "EmployeeType": "Student",
                 "JobTitle": "Computing Specialist",
-                "Department": "IT",
+                "Department": "Information Technology",
                 "Supervisor": None,
                 "AccessCategory": "AD Rights",
                 "AccessName": "VPN",
@@ -187,7 +349,7 @@ def test_recommend_for_hire_uses_same_department_reference_overlap_for_ad_cohort
             {
                 "EmployeeType": "Student",
                 "JobTitle": "Computing Specialist",
-                "Department": "IT",
+                "Department": "Information Technology",
                 "Supervisor": None,
                 "AccessCategory": "AD Rights",
                 "AccessName": "Email",
@@ -245,7 +407,7 @@ def test_recommend_for_hire_full_time_falls_back_to_copy_from_name_match():
             {
                 "EmployeeType": "Full Time",
                 "JobTitle": "Different Job",
-                "Department": "Different Dept",
+                "Department": "Completely Different Department",
                 "Supervisor": None,
                 "ReferenceEmployeeName": "Alex Doe",
                 "AccessCategory": "AD Rights",
@@ -470,7 +632,7 @@ def test_reference_matching_uses_embedding_fallback_for_title_variants():
         users_df=users_df,
         reference_df=reference_df,
         title="Asst. Dir, FSY Programs",
-        department="Unmatched Department",
+        department="CE FSY",
         employee_type="Full Time",
         supervisor=None,
         copy_from_netid="copyuser",
@@ -479,6 +641,8 @@ def test_reference_matching_uses_embedding_fallback_for_title_variants():
 
     row = recommendations.set_index("GroupName").loc["VPN"]
     assert bool(row["InReferenceSheet"]) is True
+    diag = recommendations.attrs.get("reference_diagnostics", {})
+    assert diag.get("reference_match_path") == "fallback_title_same_department"
 
 
 def test_reference_matching_is_separator_insensitive_for_group_names():

@@ -4,6 +4,7 @@ import logging
 from pathlib import Path
 import re
 import warnings
+from typing import Any
 
 import pandas as pd
 
@@ -15,7 +16,10 @@ from DataLayer.access_exclusions import (
     is_excluded_access,
     is_excluded_access_category,
 )
-from DataLayer.document_ingestion.operational_language import detect_operational_language
+from DataLayer.document_ingestion.operational_language import (
+    OperationalLanguageReason,
+    detect_operational_language,
+)
 from DataLayer.permission_normalization import normalize_single_permission
 from DataLayer.workforce_type import canonical_from_reference_employee_type
 
@@ -453,6 +457,106 @@ class RightsSheetsLoader:
         df = df.drop_duplicates().reset_index(drop=True)
         return df
 
+    @classmethod
+    def split_access_value_trace(cls, value: object) -> list[dict[str, Any]]:
+        """Deterministic replay of :meth:`_split_access_items` for debugging (read-only).
+
+        Does not mutate ``operational_language_tokens_excluded``. Keep aligned with
+        ``_split_access_items`` when changing tokenization or filters.
+        """
+        out: list[dict[str, Any]] = []
+        raw_preview = "" if pd.isna(value) else str(value).strip()
+        out.append({"kind": "cell_start", "raw_cell_preview": raw_preview[:2000]})
+        if pd.isna(value):
+            out.append({"kind": "done", "note": "na_value"})
+            return out
+        text = str(value).strip()
+        if not text:
+            out.append({"kind": "done", "note": "empty_cell"})
+            return out
+        text = text.replace(";", "\n").replace(",", "\n")
+        for part in text.split("\n"):
+            item = cls._clean_access_token(part)
+            out.append(
+                {
+                    "kind": "line_part",
+                    "raw_line": str(part).strip()[:500],
+                    "after_clean_access_token": item or None,
+                }
+            )
+            if not item:
+                out.append({"kind": "drop", "drop_reason": "clean_access_token_empty_or_noise"})
+                continue
+            expanded = cls._expand_access_token(item)
+            out.append({"kind": "expand", "fragments": list(expanded)})
+            for token in expanded:
+                tok_l = token.lower()
+                if tok_l in {"x", "n/a", "na", "none", "null"}:
+                    out.append(
+                        {
+                            "kind": "token",
+                            "token": token,
+                            "kept": False,
+                            "drop_reason": "placeholder_token",
+                            "operational_language": None,
+                            "normalized_permission": None,
+                        }
+                    )
+                    continue
+                if cls._is_likely_person_entry(token):
+                    out.append(
+                        {
+                            "kind": "token",
+                            "token": token,
+                            "kept": False,
+                            "drop_reason": "likely_person_entry",
+                            "operational_language": None,
+                            "normalized_permission": None,
+                        }
+                    )
+                    continue
+                op = detect_operational_language(token)
+                if op is not None:
+                    out.append(
+                        {
+                            "kind": "token",
+                            "token": token,
+                            "kept": False,
+                            "drop_reason": f"operational_language:{op.reason}",
+                            "operational_language": {
+                                "category": OperationalLanguageReason.CATEGORY,
+                                "reason": op.reason,
+                            },
+                            "normalized_permission": None,
+                        }
+                    )
+                    continue
+                norm = normalize_single_permission(token)
+                if norm:
+                    out.append(
+                        {
+                            "kind": "token",
+                            "token": token,
+                            "kept": True,
+                            "drop_reason": None,
+                            "operational_language": None,
+                            "normalized_permission": norm,
+                        }
+                    )
+                else:
+                    out.append(
+                        {
+                            "kind": "token",
+                            "token": token,
+                            "kept": False,
+                            "drop_reason": "normalize_single_permission_empty",
+                            "operational_language": None,
+                            "normalized_permission": None,
+                        }
+                    )
+        out.append({"kind": "done", "note": "complete"})
+        return out
+
     def _split_access_items(self, value) -> list[str]:
         if pd.isna(value):
             return []
@@ -532,7 +636,29 @@ class RightsSheetsLoader:
             return ""
         if token.startswith("http://") or token.startswith("https://"):
             return ""
+        if token.endswith(":") and not cls._has_identifier_shape(token):
+            return ""
         return token
+
+    @classmethod
+    def _has_identifier_shape(cls, token: str) -> bool:
+        """True when ``token`` without a trailing colon looks like a technical entitlement id.
+
+        Rejects obvious spreadsheet section headers (``MEMBER RIGHTS:``) while keeping
+        dotted or slug-style group names even if a stray colon suffix appears.
+        """
+        core = token.rstrip(":").strip()
+        if not core or " " in core:
+            return False
+        lower = core.lower()
+        if "." in lower or "_" in lower or "\\" in lower:
+            return True
+        if "-" not in lower:
+            return False
+        parts = lower.split("-")
+        if len(parts) < 2:
+            return False
+        return all(p and re.fullmatch(r"[a-z0-9]+", p) for p in parts)
 
     @classmethod
     def _normalize_department(cls, value) -> str | None:

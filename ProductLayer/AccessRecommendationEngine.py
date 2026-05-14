@@ -1,6 +1,10 @@
-import pandas as pd
-from collections import Counter
+import logging
 import re
+from collections import Counter
+
+import pandas as pd
+
+logger = logging.getLogger(__name__)
 
 from DataLayer.access_exclusions import (
     filter_group_list,
@@ -59,7 +63,7 @@ class AccessRecommendationEngine:
         ): {
             (
                 "computing specialist",
-                "it",
+                "information technology",
             ),
         },
     }
@@ -103,6 +107,7 @@ class AccessRecommendationEngine:
             users_df=users_df,
             copy_from_netid=copy_from_netid,
         )
+        reference_diagnostics = dict(reference_recs.attrs.get("reference_diagnostics", {}))
 
         target_user_row = build_target_user_row(
             title=title,
@@ -145,6 +150,7 @@ class AccessRecommendationEngine:
             ml_recs=ml_recs,
             copy_from_recs=copy_from_recs,
         )
+        merged.attrs["reference_diagnostics"] = reference_diagnostics
         merged = self._apply_ml_scope_diagnostics(merged, ml_audit)
         wattrs = getattr(comparison_cohort, "attrs", None) or {}
         mix = wattrs.get("workforce_mix") or {}
@@ -232,7 +238,19 @@ class AccessRecommendationEngine:
             "AmbiguousReferenceTemplate",
         ]
         if ref.empty:
-            return pd.DataFrame(columns=empty_reference_columns)
+            empty = pd.DataFrame(columns=empty_reference_columns)
+            empty.attrs["reference_diagnostics"] = {
+                "reference_match_path": "no_reference_match",
+                "target_title": str(title).strip(),
+                "target_department": str(department).strip(),
+                "target_title_clean": self._normalize_role_text(title),
+                "target_department_clean": self._normalize_role_text(department),
+                "fallback_matched_title": None,
+                "fallback_candidate_departments": [],
+                "fallback_rows_after_department_guard": 0,
+                "fallback_empty_due_to_department_mismatch": False,
+            }
+            return empty
 
         for column, default in (
             ("JobTitle", ""),
@@ -268,6 +286,20 @@ class AccessRecommendationEngine:
             else None
         )
 
+        dept_clean = self._normalize_role_text(department)
+        title_clean_norm = self._normalize_role_text(title)
+        diag: dict[str, object] = {
+            "reference_match_path": "no_reference_match",
+            "target_title": str(title).strip(),
+            "target_department": str(department).strip(),
+            "target_title_clean": title_clean_norm,
+            "target_department_clean": dept_clean,
+            "fallback_matched_title": None,
+            "fallback_candidate_departments": [],
+            "fallback_rows_after_department_guard": 0,
+            "fallback_empty_due_to_department_mismatch": False,
+        }
+
         matched = ref[
             ref.apply(
                 lambda row: (row["JobTitleClean"], row["DepartmentClean"]) in role_candidates,
@@ -284,34 +316,58 @@ class AccessRecommendationEngine:
         if employee_type_clean is not None:
             matched = matched[matched["EmployeeTypeClean"] == employee_type_clean].copy()
 
-        if matched.empty:
+        if not matched.empty:
+            diag["reference_match_path"] = "exact_title_dept"
+        else:
             if employee_type_clean is not None:
                 employee_ref = ref[ref["EmployeeTypeClean"] == employee_type_clean].copy()
             else:
                 employee_ref = ref.copy()
+
             if not employee_ref.empty:
-                # Prevent cross-department leakage (e.g., Finance rights on Help Desk).
-                dept_clean = self._normalize_role_text(department)
+                diag["fallback_candidate_departments"] = sorted(
+                    employee_ref["DepartmentClean"].dropna().astype(str).unique().tolist()
+                )
+
                 dept_scoped = employee_ref[
                     employee_ref["DepartmentClean"] == dept_clean
                 ].copy()
-                if not dept_scoped.empty:
-                    employee_ref = dept_scoped
+                diag["fallback_rows_after_department_guard"] = int(len(dept_scoped))
 
-                candidate_titles = employee_ref["JobTitle"].dropna().astype(str).unique().tolist()
-                embed_matcher = self.title_matcher
-                if embed_matcher is None:
-                    try:
-                        embed_matcher = TitleEmbedMatcher()
-                    except Exception:
-                        embed_matcher = None
+                if dept_scoped.empty:
+                    diag["fallback_empty_due_to_department_mismatch"] = bool(len(employee_ref) > 0)
+                    matched = ref.iloc[0:0].copy()
+                else:
+                    candidate_titles = dept_scoped["JobTitle"].dropna().astype(str).unique().tolist()
+                    embed_matcher = self.title_matcher
+                    if embed_matcher is None:
+                        try:
+                            embed_matcher = TitleEmbedMatcher()
+                        except Exception:
+                            embed_matcher = None
 
-                if embed_matcher is not None:
-                    best_title, _ = embed_matcher.best_match(title, candidate_titles)
-                    if best_title is not None:
-                        matched = employee_ref[
-                            employee_ref["JobTitle"].astype(str) == best_title
-                        ].copy()
+                    if embed_matcher is not None and candidate_titles:
+                        best_title, _ = embed_matcher.best_match(title, candidate_titles)
+                        if best_title is not None:
+                            matched = dept_scoped[
+                                dept_scoped["JobTitle"].astype(str) == best_title
+                            ].copy()
+                            if not matched.empty:
+                                diag["reference_match_path"] = "fallback_title_same_department"
+                                diag["fallback_matched_title"] = str(best_title)
+                                logger.debug(
+                                    "reference title fallback (department-scoped): "
+                                    "target_title=%r target_department_clean=%r "
+                                    "matched_title=%r dept_rows=%s",
+                                    title,
+                                    dept_clean,
+                                    best_title,
+                                    len(dept_scoped),
+                                )
+                        else:
+                            matched = ref.iloc[0:0].copy()
+                    else:
+                        matched = ref.iloc[0:0].copy()
 
         if employee_type_clean == "full time" and supervisor is not None:
             supervisor_clean = str(supervisor).lower().strip()
@@ -333,12 +389,14 @@ class AccessRecommendationEngine:
                     name_matches = ref[
                         (ref["EmployeeTypeClean"] == employee_type_clean)
                         & (ref["ReferenceEmployeeNameClean"] == copy_from_name_clean)
+                        & (ref["DepartmentClean"] == dept_clean)
                     ]
                     if not name_matches.empty:
                         matched = name_matches.copy()
+                        diag["reference_match_path"] = "copy_from_reference_name"
 
         if matched.empty:
-            return pd.DataFrame(columns=[
+            empty = pd.DataFrame(columns=[
                 "GroupNameClean",
                 "GroupName",
                 "InReferenceSheet",
@@ -346,6 +404,8 @@ class AccessRecommendationEngine:
                 "ReferenceTemplateCount",
                 "AmbiguousReferenceTemplate",
             ])
+            empty.attrs["reference_diagnostics"] = diag
+            return empty
 
         # Ambiguity detection (mirrors ReferenceMatcher semantics):
         # Multiple template variants under the same role can remain when
@@ -382,7 +442,9 @@ class AccessRecommendationEngine:
         grouped["ReferenceTemplateCount"] = template_count
         grouped["AmbiguousReferenceTemplate"] = ambiguous_template
 
+        grouped.attrs["reference_diagnostics"] = diag
         return grouped
+
     def _get_ad_recommendations(
         self,
         comparison_cohort: pd.DataFrame,
