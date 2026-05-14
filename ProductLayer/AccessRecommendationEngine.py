@@ -93,6 +93,7 @@ class AccessRecommendationEngine:
         supervisor: str | None = None,
         copy_from_netid: str | None = None,
         new_hire_netid: str | None = None,
+        cohort_diagnostics: bool = False,
     ) -> pd.DataFrame:
         users_df = filter_user_groups_df(users_df)
         reference_df = filter_reference_df(reference_df)
@@ -125,6 +126,7 @@ class AccessRecommendationEngine:
             copy_from_netid=copy_from_netid,
             target_user_row=target_user_row,
             peer_pool_metadata=peer_pool_metadata,
+            cohort_diagnostics=cohort_diagnostics,
         )
 
         ad_recs = self._get_ad_recommendations(
@@ -151,6 +153,10 @@ class AccessRecommendationEngine:
             copy_from_recs=copy_from_recs,
         )
         merged.attrs["reference_diagnostics"] = reference_diagnostics
+        if cohort_diagnostics:
+            merged.attrs["cohort_filter_diagnostics"] = getattr(
+                comparison_cohort, "attrs", {}
+            ).get("cohort_filter_diagnostics")
         merged = self._apply_ml_scope_diagnostics(merged, ml_audit)
         wattrs = getattr(comparison_cohort, "attrs", None) or {}
         mix = wattrs.get("workforce_mix") or {}
@@ -1410,6 +1416,7 @@ class AccessRecommendationEngine:
         copy_from_netid: str | None = None,
         target_user_row: dict[str, object] | None = None,
         peer_pool_metadata: dict[str, object] | None = None,
+        cohort_diagnostics: bool = False,
     ) -> pd.DataFrame:
         """
         Build the best comparison cohort using a 4-level fallback strategy.
@@ -1449,6 +1456,7 @@ class AccessRecommendationEngine:
                         department=department,
                         employee_type=employee_type,
                     ),
+                    cohort_diagnostics=cohort_diagnostics,
                 )
                 if peer_pool_metadata is not None:
                     peer_pool_metadata.update(peer_result.as_metadata())
@@ -1461,10 +1469,13 @@ class AccessRecommendationEngine:
                             reference_group_names,
                             title_clean,
                         )
-                        refined_anchor.attrs = {
+                        attrs = {
                             **getattr(anchor_workforce, "attrs", {}),
                             "peer_pool_locked": True,
                         }
+                        if cohort_diagnostics and peer_result.cohort_filter_diagnostics is not None:
+                            attrs["cohort_filter_diagnostics"] = peer_result.cohort_filter_diagnostics
+                        refined_anchor.attrs = attrs
                         return self._stamp_cohort_diagnostics(
                             refined_anchor,
                             fallback_level=0,

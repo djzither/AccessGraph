@@ -14,9 +14,6 @@ DEFAULT_SUPERVISOR_TITLE_KEYWORDS: tuple[str, ...] = (
     "manager",
     "supervisor",
     "director",
-    "lead",
-    "coordinator",
-    "admin",
     "administrator",
     "assistant director",
     "dean",
@@ -168,7 +165,19 @@ def _permission_count(row: Any) -> int:
 def _title_matches_keywords(title: str, keywords: tuple[str, ...]) -> bool:
     if not title:
         return False
-    return any(keyword in title for keyword in keywords)
+    t = title.lower().strip()
+    for keyword in keywords:
+        kw = keyword.strip().lower()
+        if not kw:
+            continue
+        if " " in kw:
+            parts = [re.escape(p) for p in kw.split()]
+            pattern = r"\b" + r"\s+".join(parts) + r"\b"
+        else:
+            pattern = rf"\b{re.escape(kw)}\b"
+        if re.search(pattern, t):
+            return True
+    return False
 
 
 def _owns_sensitive_groups(row: Any) -> bool:
@@ -327,6 +336,7 @@ class PeerPoolBuildResult:
     students_excluded_for_full_time_target: list[str] = field(default_factory=list)
     manager_of_others_excluded: list[str] = field(default_factory=list)
     fallback_reason: str = ""
+    cohort_filter_diagnostics: dict[str, Any] | None = None
 
     def as_metadata(self) -> dict[str, object]:
         return {
@@ -370,12 +380,42 @@ def _manager_netid_for_row(row: Any) -> str:
     return parse_manager_netid(_row_value(row, "Manager", "")) or ""
 
 
+def peer_cohort_user_snapshot(row: Any) -> dict[str, Any]:
+    """Stable diagnostic fields for a user row (Series or dict-like)."""
+    return {
+        "SamAccountName": str(_row_value(row, "SamAccountName", "")),
+        "Title": str(_row_value(row, "Title", "")),
+        "Department": str(_row_value(row, "Department", "")),
+        "EmployeeType": str(_row_value(row, "EmployeeType", "")),
+        "Manager": str(_row_value(row, "Manager", "")),
+        "IsSupervisor": bool(_truthy_flag(_row_value(row, "IsSupervisor", False))),
+    }
+
+
+def explain_peer_cohort_build(
+    users_df: pd.DataFrame,
+    anchor_user_row: Any,
+    target_user_row: Any | None = None,
+    *,
+    title_keywords: tuple[str, ...] = DEFAULT_SUPERVISOR_TITLE_KEYWORDS,
+) -> dict[str, Any] | None:
+    """Return cohort filter diagnostics (for notebooks / optional engine flag)."""
+    return build_peer_pool_from_anchor(
+        users_df,
+        anchor_user_row,
+        target_user_row,
+        title_keywords=title_keywords,
+        cohort_diagnostics=True,
+    ).cohort_filter_diagnostics
+
+
 def build_peer_pool_from_anchor(
     users_df: pd.DataFrame,
     anchor_user_row: Any,
     target_user_row: Any | None = None,
     *,
     title_keywords: tuple[str, ...] = DEFAULT_SUPERVISOR_TITLE_KEYWORDS,
+    cohort_diagnostics: bool = False,
 ) -> PeerPoolBuildResult:
     target_row = target_user_row if target_user_row is not None else anchor_user_row
     users = users_df.copy()
@@ -428,6 +468,18 @@ def build_peer_pool_from_anchor(
     else:
         candidates = same_type
 
+    removals: list[dict[str, Any]] = []
+    scoped_snapshots: list[dict[str, Any]] = []
+    if cohort_diagnostics:
+        for _, r in candidates.iterrows():
+            scoped_snapshots.append(peer_cohort_user_snapshot(r))
+
+    def _record_removal(row: pd.Series, rule: str) -> None:
+        if cohort_diagnostics:
+            entry = peer_cohort_user_snapshot(row)
+            entry["exclusion_rule"] = rule
+            removals.append(entry)
+
     selected_rows: list[pd.Series] = []
     excluded_supervisors: list[str] = []
     excluded_outliers: list[str] = []
@@ -446,6 +498,7 @@ def build_peer_pool_from_anchor(
         candidate_netid = str(candidate.get("SamAccountName", ""))
         if candidate_netid == anchor_netid:
             if anchor_mismatch:
+                _record_removal(candidate, "anchor_mismatch_skip_self_copy")
                 continue
             selected_rows.append(candidate)
             continue
@@ -461,12 +514,15 @@ def build_peer_pool_from_anchor(
 
         if target_workforce == WORKFORCE_STUDENT and candidate_workforce == WORKFORCE_FULL_TIME:
             full_time_excluded.append(candidate_netid)
+            _record_removal(candidate, "student_target_excludes_full_time_peer")
             continue
         if target_workforce == WORKFORCE_FULL_TIME and candidate_workforce == WORKFORCE_STUDENT:
             students_excluded.append(candidate_netid)
+            _record_removal(candidate, "full_time_target_excludes_student_peer")
             continue
         if target_workforce == WORKFORCE_STUDENT and is_manager_of_others(users, candidate_netid):
             manager_of_others_excluded.append(candidate_netid)
+            _record_removal(candidate, "student_target_excludes_manager_of_others")
             continue
 
         if not is_valid_peer_relationship(
@@ -478,18 +534,28 @@ def build_peer_pool_from_anchor(
         ):
             if candidate_supervisor:
                 excluded_supervisors.append(candidate_netid)
+                _record_removal(
+                    candidate,
+                    "invalid_peer_relationship_supervisor_like_candidate",
+                )
             else:
                 excluded_outliers.append(candidate_netid)
+                _record_removal(
+                    candidate,
+                    "invalid_peer_relationship_workforce_or_peer_policy",
+                )
             continue
 
         if target_workforce == WORKFORCE_STUDENT and not anchor_supervisor and candidate_supervisor:
             excluded_supervisors.append(candidate_netid)
+            _record_removal(candidate, "student_target_excludes_supervisor_like_peer")
             continue
 
         if not anchor_supervisor:
             candidate_group_count = _permission_count(candidate)
             if candidate_group_count > max(anchor_group_count * 1.5, anchor_group_count + 6):
                 excluded_outliers.append(candidate_netid)
+                _record_removal(candidate, "outlier_permission_count_vs_anchor")
                 continue
 
         selected_rows.append(candidate)
@@ -582,6 +648,26 @@ def build_peer_pool_from_anchor(
         f"target={target_workforce}; anchor={anchor_workforce}"
     )
 
+    cohort_filter_diagnostics: dict[str, Any] | None = None
+    if cohort_diagnostics:
+        final_peers = (
+            [peer_cohort_user_snapshot(r) for _, r in peer_pool.iterrows()]
+            if not peer_pool.empty
+            else []
+        )
+        cohort_filter_diagnostics = {
+            "anchor_samaccountname": anchor_netid,
+            "anchor_department_clean": anchor_department_clean,
+            "anchor_title_clean": anchor_title_clean,
+            "target_workforce_type": target_workforce,
+            "anchor_mismatch": anchor_mismatch,
+            "scoped_candidate_count": int(len(candidates)),
+            "scoped_candidates": scoped_snapshots,
+            "removals": removals,
+            "final_peer_count": int(len(peer_pool)),
+            "final_peers": final_peers,
+        }
+
     return PeerPoolBuildResult(
         peer_pool=peer_pool,
         anchor_user_name=anchor_name,
@@ -601,6 +687,7 @@ def build_peer_pool_from_anchor(
         students_excluded_for_full_time_target=students_excluded,
         manager_of_others_excluded=manager_of_others_excluded,
         fallback_reason=fallback_reason,
+        cohort_filter_diagnostics=cohort_filter_diagnostics,
     )
 
 

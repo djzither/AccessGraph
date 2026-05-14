@@ -5,12 +5,14 @@ from DataLayer.peer_cohort import (
     build_peer_pool_from_anchor,
     build_target_user_row,
     contamination_stats_for_group,
+    explain_peer_cohort_build,
     infer_workforce_type_from_groups,
     is_manager_of_others,
     is_supervisor_like,
     is_valid_peer_relationship,
     normalize_groups,
     parse_manager_netid,
+    peer_cohort_user_snapshot,
 )
 from ProductLayer.AccessRecommendationEngine import AccessRecommendationEngine
 
@@ -834,3 +836,183 @@ def test_recommend_for_hire_exposes_cohort_diagnostics_metadata():
     assert row["CohortFallbackLevel"] == 0
     assert row["CohortUsedMix"] == row["CohortEmployeeTypeMix"]
     assert row["CohortUsedMix"] == "Student=2"
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Computing Specialist",
+        "IT Specialist",
+        "Data Analyst",
+        "Event Coordinator",
+        "Help Desk Admin",
+        "Team Lead",
+    ],
+)
+def test_is_supervisor_like_does_not_flag_common_technical_titles(title):
+    row = {
+        "SamAccountName": "tech.user",
+        "Title": title,
+        "EmployeeType": "Full Time",
+        "GroupsList": ["a.FULL TIME STAFF", "VPN"],
+        "IsSupervisor": False,
+    }
+    users = pd.DataFrame([row])
+    assert (
+        is_supervisor_like(
+            row,
+            users_df=users,
+            cohort_median_group_count=10.0,
+        )
+        is False
+    )
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "IT Help Desk Manager",
+        "Shipping Supervisor",
+        "Director of Operations",
+        "Assistant Director Programs",
+        "Systems Administrator",
+    ],
+)
+def test_is_supervisor_like_detects_management_titles(title):
+    row = {
+        "SamAccountName": "mgr.user",
+        "Title": title,
+        "EmployeeType": "Full Time",
+        "GroupsList": ["a.FULL TIME STAFF", "VPN"],
+        "IsSupervisor": False,
+    }
+    users = pd.DataFrame([row])
+    assert is_supervisor_like(row, users_df=users, cohort_median_group_count=10.0) is True
+
+
+def test_peer_cohort_user_snapshot_includes_expected_fields():
+    row = pd.Series(
+        {
+            "SamAccountName": "u1",
+            "Title": "Analyst",
+            "Department": "IT",
+            "EmployeeType": "Student",
+            "Manager": "CN=boss,OU=People,DC=x",
+            "IsSupervisor": False,
+        }
+    )
+    snap = peer_cohort_user_snapshot(row)
+    assert snap["SamAccountName"] == "u1"
+    assert snap["Title"] == "Analyst"
+    assert snap["Department"] == "IT"
+    assert snap["EmployeeType"] == "Student"
+    assert "boss" in snap["Manager"].lower()
+    assert snap["IsSupervisor"] is False
+
+
+def test_build_peer_pool_cohort_diagnostics_records_removals():
+    users_df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "student.anchor",
+                "DisplayName": "Student Anchor",
+                "Title": "Student Worker",
+                "Department": "IT",
+                "EmployeeType": "Student",
+                "GroupsList": ["a.FULL TIME STUDENT", "Email"],
+            },
+            {
+                "SamAccountName": "super.peer",
+                "DisplayName": "Super Peer",
+                "Title": "Student Worker",
+                "Department": "IT",
+                "EmployeeType": "Student",
+                "GroupsList": ["a.FULL TIME STUDENT", "Email"],
+                "IsSupervisor": True,
+            },
+            {
+                "SamAccountName": "student.peer",
+                "DisplayName": "Student Peer",
+                "Title": "Student Worker",
+                "Department": "IT",
+                "EmployeeType": "Student",
+                "GroupsList": ["a.FULL TIME STUDENT", "Email"],
+            },
+        ]
+    )
+    anchor = users_df.iloc[0]
+    target = build_target_user_row(
+        title="Student Worker",
+        department="IT",
+        employee_type="Student",
+    )
+    result = build_peer_pool_from_anchor(
+        users_df,
+        anchor,
+        target,
+        cohort_diagnostics=True,
+    )
+    diag = result.cohort_filter_diagnostics
+    assert diag is not None
+    assert diag["scoped_candidate_count"] >= 2
+    assert len(diag["scoped_candidates"]) == diag["scoped_candidate_count"]
+    by_netid = {r["SamAccountName"]: r for r in diag["removals"]}
+    assert "super.peer" in by_netid
+    assert (
+        by_netid["super.peer"]["exclusion_rule"]
+        == "invalid_peer_relationship_supervisor_like_candidate"
+    )
+    assert any(p["SamAccountName"] == "student.peer" for p in diag["final_peers"])
+    explain_diag = explain_peer_cohort_build(users_df, anchor, target)
+    assert explain_diag is not None
+    assert explain_diag["removals"] == diag["removals"]
+
+
+def test_recommend_for_hire_merged_attrs_include_cohort_filter_diagnostics_when_requested():
+    users_df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "student.anchor",
+                "DisplayName": "Student Anchor",
+                "Title": "Student Worker",
+                "Department": "IT",
+                "EmployeeType": "Student",
+                "GroupsList": ["a.FULL TIME STUDENT", "Email"],
+            },
+            {
+                "SamAccountName": "student.peer",
+                "DisplayName": "Student Peer",
+                "Title": "Student Worker",
+                "Department": "IT",
+                "EmployeeType": "Student",
+                "GroupsList": ["a.FULL TIME STUDENT", "Email"],
+            },
+        ]
+    )
+    reference_df = pd.DataFrame(
+        columns=[
+            "EmployeeType",
+            "JobTitle",
+            "Department",
+            "Supervisor",
+            "AccessCategory",
+            "AccessName",
+            "AccessNameClean",
+            "SourceFile",
+        ]
+    )
+    engine = AccessRecommendationEngine(min_confidence=0.4)
+    recs = engine.recommend_for_hire(
+        users_df=users_df,
+        reference_df=reference_df,
+        title="Student Worker",
+        department="IT",
+        employee_type="Student",
+        supervisor=None,
+        copy_from_netid="student.anchor",
+        cohort_diagnostics=True,
+    )
+    diag = recs.attrs.get("cohort_filter_diagnostics")
+    assert diag is not None
+    assert diag["final_peer_count"] >= 1
+    assert diag["scoped_candidate_count"] >= 1
