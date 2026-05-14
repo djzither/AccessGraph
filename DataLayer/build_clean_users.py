@@ -13,6 +13,7 @@ from DataLayer.access_exclusions import (
     is_excluded_permission,
 )
 from DataLayer.cleaner import DataCleaner
+from DataLayer.document_ingestion.operational_language import OperationalLanguageReason
 from DataLayer.permission_normalization import normalize_groups_input
 from DataLayer.rights_sheets_loader import RightsSheetsLoader
 
@@ -142,6 +143,10 @@ def build_clean_users(
         "raw_row_count": int(raw_rows),
         "cleaned_row_count": int(len(cleaned)),
         "reference_row_count": int(len(reference_df)),
+        "operational_language_excluded_tokens": int(
+            getattr(reference_loader, "operational_language_rows_excluded", 0)
+        ),
+        "operational_language_exclusion_category": OperationalLanguageReason.CATEGORY,
         "reference_row_count_by_source": {
             str(key): int(value)
             for key, value in reference_df["SourceFile"].value_counts().items()

@@ -15,6 +15,7 @@ from DataLayer.access_exclusions import (
     is_excluded_access,
     is_excluded_access_category,
 )
+from DataLayer.document_ingestion.operational_language import detect_operational_language
 from DataLayer.permission_normalization import normalize_single_permission
 from DataLayer.workforce_type import canonical_from_reference_employee_type
 
@@ -117,8 +118,11 @@ class RightsSheetsLoader:
     def __init__(self, raw_path: str | Path):
         self.raw_path = Path(raw_path)
         self.validation: list[dict] = []
+        self.operational_language_tokens_excluded: int = 0
+        self.operational_language_rows_excluded: int = 0
 
     def load_reference_sheets(self) -> pd.DataFrame:
+        self.operational_language_tokens_excluded = 0
         frames = [
             self._load_and_normalize("full_time_employee_access.xlsx", "Full Time"),
             self._load_and_normalize("student_employee_access.xlsx", "Student"),
@@ -126,6 +130,8 @@ class RightsSheetsLoader:
         combined = pd.concat(frames, ignore_index=True)
         excluded = count_excluded_reference_rows(combined)
         combined = filter_reference_df(self._finalize_output(combined))
+
+        self.operational_language_rows_excluded = self.operational_language_tokens_excluded
 
         logger.debug("reference combined row count=%s excluded_crm=%s", len(combined), excluded)
         if not combined.empty:
@@ -228,7 +234,8 @@ class RightsSheetsLoader:
                             )
                         )
 
-        result = filter_reference_df(self._finalize_output(pd.DataFrame(rows)))
+        finalized_frame = self._finalize_output(pd.DataFrame(rows))
+        result = filter_reference_df(finalized_frame)
         empty_ratio = empty_access_cells / access_cells if access_cells else 1.0
         self._record_validation(
             file_name=file_name,
@@ -462,6 +469,9 @@ class RightsSheetsLoader:
                 if token.lower() in {"x", "n/a", "na", "none", "null"}:
                     continue
                 if self._is_likely_person_entry(token):
+                    continue
+                if detect_operational_language(token) is not None:
+                    self.operational_language_tokens_excluded += 1
                     continue
                 norm = normalize_single_permission(token)
                 if norm:

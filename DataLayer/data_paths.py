@@ -25,6 +25,11 @@ REAL_CLEAN_USERS_PATH = Path("data/processed/clean_users.parquet")
 REAL_ACCESS_REFERENCE_PATH = Path("data/processed/access_reference.parquet")
 REAL_RAW_DATA_DIR = Path("data/raw")
 
+# Legacy note: some scripts historically wrote ``reference_access.parquet``.
+# The canonical processed reference file is ``access_reference.parquet``
+# (see :func:`access_reference_path`). ``scripts/run_real_pipeline.py`` aligns
+# with that name.
+
 DEMO_CLEAN_USERS_PATH = Path("data/demo_processed/sanitized_clean_users.parquet")
 DEMO_ACCESS_REFERENCE_PATH = Path("data/demo_processed/sanitized_access_reference.parquet")
 

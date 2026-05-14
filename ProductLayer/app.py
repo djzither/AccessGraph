@@ -59,7 +59,6 @@ _DEMO_TICKET_TABLE_COLS: tuple[str, ...] = (
 # (no code edits required — see DataLayer/data_paths.py).
 DEFAULT_CLEAN_DATA_PATH = clean_users_path()
 DEFAULT_RAW_DATA_PATH = raw_data_dir()
-DEFAULT_REFERENCE_DATA_PATH = access_reference_path()
 
 # Decision label → (icon, background colour)
 DECISION_BADGE: dict[str, tuple[str, str]] = {
@@ -96,13 +95,40 @@ def load_demo_servicenow_tickets(path_str: str, mtime: float) -> pd.DataFrame:
     return pd.read_parquet(path_str)
 
 
+def _reference_data_cache_mtime(raw_data_dir: str) -> float:
+    """Max mtime of reference parquet (demo/real) and raw access workbooks.
+
+    Used only as a Streamlit ``@st.cache_data`` invalidation key so edits to
+    ``data/raw/*.xlsx`` or the active ``access_reference_path()`` parquet bust
+    the reference cache without restarting the app.
+    """
+    times: list[float] = []
+    try:
+        ref_path = access_reference_path()
+        if ref_path.is_file():
+            times.append(ref_path.stat().st_mtime)
+    except OSError:
+        pass
+    rd = Path(raw_data_dir)
+    for name in ("full_time_employee_access.xlsx", "student_employee_access.xlsx"):
+        fp = rd / name
+        if fp.is_file():
+            try:
+                times.append(fp.stat().st_mtime)
+            except OSError:
+                pass
+    return max(times) if times else 0.0
+
+
 @st.cache_data
-def load_reference(raw_data_path: str) -> pd.DataFrame:
+def load_reference(raw_data_path: str, cache_invalidation_mtime: float) -> pd.DataFrame:
     # In demo mode the raw xlsx files are not shipped — load the sanitized
     # access_reference parquet directly so the engine still has reference signal.
+    _ = cache_invalidation_mtime
     if is_demo_mode():
         try:
-            return filter_reference_df(pd.read_parquet(DEFAULT_REFERENCE_DATA_PATH))
+            ref_path = access_reference_path()
+            return filter_reference_df(pd.read_parquet(ref_path))
         except Exception:
             return pd.DataFrame()
     try:
@@ -1241,7 +1267,11 @@ def main() -> None:
         st.stop()
 
     # Load reference sheets (optional — degrades gracefully)
-    reference_df = load_reference(raw_path)
+    try:
+        ref_mtime = _reference_data_cache_mtime(raw_path)
+    except OSError:
+        ref_mtime = 0.0
+    reference_df = load_reference(raw_path, ref_mtime)
     if reference_df.empty:
         st.sidebar.warning("⚠️ Reference sheets not found — reference signal disabled.")
     else:
