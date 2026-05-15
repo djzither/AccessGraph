@@ -552,6 +552,16 @@ def render_onboarding_tab(
 
     engine = AccessRecommendationEngine(min_confidence=min_confidence)
     ref = reference_df if not reference_df.empty else _empty_reference_df()
+    confirmed_bridge = st.session_state.get("ob_confirmed_role_bridge")
+    if confirmed_bridge:
+        st.info(
+            "Using confirmed access-sheet bridge: "
+            f"**{confirmed_bridge.get('access_template_title')}** "
+            f"({confirmed_bridge.get('access_template_department')})."
+        )
+        if st.button("Clear confirmed bridge", key="ob_clear_bridge"):
+            del st.session_state["ob_confirmed_role_bridge"]
+            st.rerun()
 
     with st.spinner("Running hybrid recommendation engine…"):
         try:
@@ -564,6 +574,7 @@ def render_onboarding_tab(
                 supervisor=supervisor or None,
                 copy_from_netid=copy_from or None,
                 new_hire_netid=new_hire_netid or None,
+                confirmed_role_bridge=confirmed_bridge,
             )
         except Exception as exc:
             st.error(f"Engine error: {exc}")
@@ -612,6 +623,48 @@ def render_onboarding_tab(
             warn = str(role_inf.get("warning") or "").strip()
             if warn:
                 st.warning(warn)
+
+    role_bridge = getattr(recs, "attrs", {}).get("role_bridge") or {}
+    if role_bridge and not role_bridge.get("confirmed"):
+        prompt = str(role_bridge.get("prompt_message") or "").strip()
+        candidates = role_bridge.get("candidates") or []
+        if prompt:
+            st.warning(prompt)
+        if candidates:
+            with st.expander("Access template bridge (confirm to rebuild)", expanded=True):
+                labels = [
+                    (
+                        f"{c.get('access_template_title')} — {c.get('access_template_department')} "
+                        f"(confidence {float(c.get('bridge_confidence', 0)):.0%}; "
+                        f"{c.get('explanation')})"
+                    )
+                    for c in candidates
+                ]
+                pick = st.radio(
+                    "Use access-sheet template",
+                    options=list(range(len(candidates))),
+                    format_func=lambda i: labels[i],
+                    key="ob_bridge_pick",
+                )
+                if st.button("Confirm template and rebuild recommendations", key="ob_bridge_confirm"):
+                    chosen = candidates[int(pick)]
+                    st.session_state["ob_confirmed_role_bridge"] = {
+                        "access_template_title": chosen.get("access_template_title"),
+                        "access_template_department": chosen.get("access_template_department"),
+                        "employee_type": chosen.get("employee_type", employee_type),
+                        "template_permission_ids": chosen.get("template_permission_ids", []),
+                    }
+                    st.rerun()
+        elif role_bridge.get("ambiguous"):
+            st.warning(
+                "Multiple access templates are similarly close. "
+                "Pick one in the bridge panel above or refine ticket fields."
+            )
+    elif role_bridge.get("confirmed"):
+        st.success(
+            "Recommendations rebuilt using confirmed access-sheet bridge: "
+            f"**{role_bridge.get('bridged_reference_title')}**."
+        )
 
     # ── Results table ─────────────────────────────────────────────────────────
     display_cols = [

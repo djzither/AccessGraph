@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list
-from DataLayer.permission_normalization import normalize_groups_input
+from DataLayer.permission_normalization import canonical_permission_id, normalize_groups_input
 from DataLayer.canonical_role import (
     MATCH_PATH_EXACT_FALLBACK,
     MATCH_PATH_REGISTRY,
@@ -911,6 +911,94 @@ def contamination_stats_for_group(
         full_time_support_count=full_time_support,
         same_manager_peer_support_count=same_manager_support,
     )
+
+
+PROVENANCE_DIRECT_ROLE = "direct_role_match"
+PROVENANCE_BRIDGE_TITLE = "bridge_template_title"
+PROVENANCE_BRIDGE_PERMISSION = "bridge_permission_overlap"
+
+
+@dataclass
+class BridgeExpandedCohortResult:
+    cohort: pd.DataFrame
+    provenance_summary: dict[str, int] = field(default_factory=dict)
+
+
+def _bridge_user_permission_set(row: Any) -> frozenset[str]:
+    groups = filter_group_list(_row_value(row, "GroupsList", None))
+    return frozenset(pid for g in groups if (pid := canonical_permission_id(g)))
+
+
+def build_bridge_expanded_cohort(
+    users_df: pd.DataFrame,
+    *,
+    department_clean: str,
+    workforce_canonical: str,
+    canonical_role_id_target: str,
+    bridge_title_clean: str,
+    template_permission_ids: frozenset[str],
+    min_permission_overlap_ratio: float = 0.50,
+) -> BridgeExpandedCohortResult:
+    """Expand cohort beyond strict canonical_role_id using bridged template evidence."""
+    min_ratio = min_permission_overlap_ratio
+    users = users_df.copy()
+    users["TitleClean"] = users["Title"].apply(_normalize_role_text)
+    users["DepartmentClean"] = users["Department"].apply(_normalize_role_text)
+
+    selected: list[pd.Series] = []
+    provenance: list[str] = []
+    seen: set[str] = set()
+
+    def _add(row: pd.Series, source: str) -> None:
+        netid = str(row.get("SamAccountName", "")).strip()
+        if not netid or netid in seen:
+            return
+        seen.add(netid)
+        selected.append(row)
+        provenance.append(source)
+
+    target_wf = workforce_canonical
+    for _, row in users.iterrows():
+        if str(row.get("DepartmentClean", "")) != department_clean:
+            continue
+        row_wf = _workforce_to_canonical(infer_workforce_type(row))
+        if target_wf in {FULL_TIME, STUDENT} and row_wf != target_wf:
+            continue
+
+        resolved = canonical_role_id(
+            title=row.get("Title", ""),
+            department=row.get("Department", ""),
+            employee_type=row.get("EmployeeType"),
+            workforce_canonical=target_wf,
+        )
+        if resolved.canonical_role_id == canonical_role_id_target:
+            _add(row, PROVENANCE_DIRECT_ROLE)
+            continue
+        if bridge_title_clean and str(row.get("TitleClean", "")) == bridge_title_clean:
+            _add(row, PROVENANCE_BRIDGE_TITLE)
+            continue
+        if template_permission_ids:
+            perms = _bridge_user_permission_set(row)
+            overlap = len(perms & template_permission_ids) / max(len(template_permission_ids), 1)
+            if overlap >= min_ratio:
+                _add(row, PROVENANCE_BRIDGE_PERMISSION)
+
+    cohort = pd.DataFrame(selected) if selected else pd.DataFrame(columns=users.columns)
+    if not cohort.empty:
+        cohort = cohort.copy()
+        cohort["CohortProvenance"] = provenance
+
+    summary = {
+        PROVENANCE_DIRECT_ROLE: provenance.count(PROVENANCE_DIRECT_ROLE),
+        PROVENANCE_BRIDGE_TITLE: provenance.count(PROVENANCE_BRIDGE_TITLE),
+        PROVENANCE_BRIDGE_PERMISSION: provenance.count(PROVENANCE_BRIDGE_PERMISSION),
+    }
+    cohort.attrs = {
+        **(getattr(cohort, "attrs", None) or {}),
+        "bridge_expanded_cohort": True,
+        "cohort_provenance_summary": summary,
+    }
+    return BridgeExpandedCohortResult(cohort=cohort, provenance_summary=summary)
 
 
 def build_target_user_row(

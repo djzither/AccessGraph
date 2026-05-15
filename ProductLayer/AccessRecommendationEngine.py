@@ -21,6 +21,7 @@ from DataLayer.workforce_type import (
     reference_match_value,
 )
 from DataLayer.peer_cohort import (
+    build_bridge_expanded_cohort,
     build_peer_pool_from_anchor,
     build_target_user_row,
     contamination_stats_for_group,
@@ -32,6 +33,12 @@ from DataLayer.role_inference import (
     INFERRED_MATCH_PATHS,
     resolve_onboarding_role,
     supervisor_cell_matches_target,
+)
+from DataLayer.role_bridge import (
+    MATCH_PATH_CONFIRMED_ROLE_BRIDGE,
+    RoleBridgeConfirmation,
+    confirmed_bridge_role_result,
+    generate_role_bridge_candidates,
 )
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_labels import apply_access_pattern_columns
@@ -106,6 +113,7 @@ class AccessRecommendationEngine:
         new_hire_netid: str | None = None,
         cohort_diagnostics: bool = False,
         recommendation_debug: bool = False,
+        confirmed_role_bridge: dict[str, object] | None = None,
     ) -> pd.DataFrame:
         users_df = filter_user_groups_df(users_df)
         reference_df = filter_reference_df(reference_df)
@@ -122,10 +130,27 @@ class AccessRecommendationEngine:
             users_df=users_df,
         )
 
+        bridge_confirmation = RoleBridgeConfirmation.from_mapping(confirmed_role_bridge)
+        reference_title = title
+        reference_department = department
+        target_role = role_resolution.role
+        bridge_template_permissions: frozenset[str] = frozenset()
+
+        if bridge_confirmation is not None:
+            reference_title = bridge_confirmation.access_template_title
+            reference_department = bridge_confirmation.access_template_department
+            target_role = confirmed_bridge_role_result(
+                bridge_confirmation,
+                workforce_canonical=role_resolution.role.workforce_canonical,
+            )
+            raw_perms = confirmed_role_bridge.get("template_permission_ids", []) if confirmed_role_bridge else []
+            if isinstance(raw_perms, (list, tuple, set)):
+                bridge_template_permissions = frozenset(str(p) for p in raw_perms if str(p).strip())
+
         reference_recs = self._get_reference_recommendations(
             reference_df=reference_df,
-            title=title,
-            department=department,
+            title=reference_title,
+            department=reference_department,
             employee_type=employee_type,
             supervisor=supervisor,
             users_df=users_df,
@@ -133,6 +158,9 @@ class AccessRecommendationEngine:
             reference_debug=debug,
         )
         reference_diagnostics = dict(reference_recs.attrs.get("reference_diagnostics", {}))
+        reference_permission_count = 0
+        if not reference_recs.empty and "InReferenceSheet" in reference_recs.columns:
+            reference_permission_count = int(reference_recs["InReferenceSheet"].fillna(False).astype(bool).sum())
 
         target_user_row = build_target_user_row(
             title=title,
@@ -141,18 +169,84 @@ class AccessRecommendationEngine:
             sam_account_name=new_hire_netid or "",
         )
         peer_pool_metadata: dict[str, object] = {}
-        comparison_cohort = self._select_ad_comparison_cohort(
-            users_df=users_df,
-            title=title,
-            department=department,
-            reference_recs=reference_recs,
-            employee_type=employee_type,
-            copy_from_netid=copy_from_netid,
-            target_user_row=target_user_row,
-            peer_pool_metadata=peer_pool_metadata,
-            cohort_diagnostics=debug,
-            target_role=role_resolution.role,
-        )
+        comparison_cohort: pd.DataFrame
+        if bridge_confirmation is not None:
+            if not bridge_template_permissions and not reference_recs.empty:
+                bridge_template_permissions = frozenset(
+                    reference_recs.loc[
+                        reference_recs["InReferenceSheet"].fillna(False).astype(bool),
+                        "GroupNameClean",
+                    ]
+                    .dropna()
+                    .astype(str)
+                )
+            bridge_cohort = build_bridge_expanded_cohort(
+                users_df,
+                department_clean=target_role.department_clean or self._normalize_role_text(department),
+                workforce_canonical=target_role.workforce_canonical,
+                canonical_role_id_target=target_role.canonical_role_id,
+                bridge_title_clean=target_role.title_clean,
+                template_permission_ids=bridge_template_permissions,
+            ).cohort
+            if len(bridge_cohort) >= 2:
+                comparison_cohort = self._refine_by_reference_overlap(
+                    bridge_cohort,
+                    set(reference_recs["GroupNameClean"].dropna().astype(str))
+                    if not reference_recs.empty and "GroupNameClean" in reference_recs.columns
+                    else set(),
+                    self._normalize_role_text(reference_title),
+                )
+                comparison_cohort.attrs = {
+                    **getattr(bridge_cohort, "attrs", {}),
+                    "bridge_expanded_cohort": True,
+                    "cohort_used_for_scoring": "bridge_expanded_cohort",
+                }
+                comparison_cohort = self._stamp_cohort_diagnostics(
+                    comparison_cohort,
+                    fallback_level=0,
+                    used_for_scoring="bridge_expanded_cohort",
+                )
+            else:
+                comparison_cohort = self._select_ad_comparison_cohort(
+                    users_df=users_df,
+                    title=reference_title,
+                    department=reference_department,
+                    reference_recs=reference_recs,
+                    employee_type=employee_type,
+                    copy_from_netid=copy_from_netid,
+                    target_user_row=target_user_row,
+                    peer_pool_metadata=peer_pool_metadata,
+                    cohort_diagnostics=debug,
+                    target_role=target_role,
+                )
+        else:
+            comparison_cohort = self._select_ad_comparison_cohort(
+                users_df=users_df,
+                title=title,
+                department=department,
+                reference_recs=reference_recs,
+                employee_type=employee_type,
+                copy_from_netid=copy_from_netid,
+                target_user_row=target_user_row,
+                peer_pool_metadata=peer_pool_metadata,
+                cohort_diagnostics=debug,
+                target_role=target_role,
+            )
+
+        role_bridge_resolution = None
+        if bridge_confirmation is None:
+            role_bridge_resolution = generate_role_bridge_candidates(
+                ticket_title=title,
+                department=department,
+                employee_type=employee_type,
+                supervisor=supervisor,
+                copy_from_netid=copy_from_netid,
+                current_role=role_resolution.role,
+                reference_df=reference_df,
+                users_df=users_df,
+                reference_match_path=str(reference_diagnostics.get("reference_match_path", "")),
+                reference_permission_count=reference_permission_count,
+            )
 
         ad_recs = self._get_ad_recommendations(
             comparison_cohort=comparison_cohort,
@@ -178,19 +272,54 @@ class AccessRecommendationEngine:
             copy_from_recs=copy_from_recs,
         )
         merged.attrs["reference_diagnostics"] = reference_diagnostics
+        active_role = target_role
+        active_match_path = active_role.match_path
+        active_ceiling = role_resolution.confidence_ceiling
+        if bridge_confirmation is not None:
+            active_match_path = MATCH_PATH_CONFIRMED_ROLE_BRIDGE
+            active_ceiling = min(active_ceiling, 0.85)
+
         merged.attrs["role_inference"] = {
-            "canonical_role_id": role_resolution.role.canonical_role_id,
-            "role_match_path": role_resolution.role.match_path,
-            "confidence_ceiling": role_resolution.confidence_ceiling,
+            "canonical_role_id": active_role.canonical_role_id,
+            "role_match_path": active_match_path,
+            "confidence_ceiling": active_ceiling,
             "warning": role_resolution.warning,
             "ambiguous": role_resolution.ambiguous,
             "candidate_roles": list(role_resolution.candidate_roles),
             "inference_debug": dict(role_resolution.inference_debug),
         }
-        if role_resolution.confidence_ceiling < 1.0:
-            merged["RoleInferenceWarning"] = role_resolution.warning
-            merged["RoleMatchPath"] = role_resolution.role.match_path
-            merged["InferredCanonicalRoleId"] = role_resolution.role.canonical_role_id
+        if bridge_confirmation is not None:
+            merged.attrs["role_bridge"] = {
+                "confirmed": True,
+                "bridged_reference_title": bridge_confirmation.access_template_title,
+                "bridged_reference_department": bridge_confirmation.access_template_department,
+                "role_match_path": MATCH_PATH_CONFIRMED_ROLE_BRIDGE,
+                "cohort_mode": (comparison_cohort.attrs or {}).get(
+                    "cohort_used_for_scoring", ""
+                ),
+                "provenance_summary": (comparison_cohort.attrs or {}).get(
+                    "cohort_provenance_summary", {}
+                ),
+            }
+            merged["BridgedReferenceTitle"] = bridge_confirmation.access_template_title
+            merged["BridgedReferenceDepartment"] = bridge_confirmation.access_template_department
+            merged["RoleMatchPath"] = MATCH_PATH_CONFIRMED_ROLE_BRIDGE
+        elif role_bridge_resolution is not None:
+            merged.attrs["role_bridge"] = {
+                "confirmed": False,
+                "needs_confirmation": role_bridge_resolution.needs_confirmation,
+                "ambiguous": role_bridge_resolution.ambiguous,
+                "prompt_message": role_bridge_resolution.prompt_message,
+                "candidates": [c.to_dict() for c in role_bridge_resolution.candidates],
+                "debug": dict(role_bridge_resolution.debug),
+            }
+            if role_bridge_resolution.prompt_message:
+                merged["RoleBridgeWarning"] = role_bridge_resolution.prompt_message
+        if active_ceiling < 1.0:
+            if role_resolution.warning:
+                merged["RoleInferenceWarning"] = role_resolution.warning
+            merged["RoleMatchPath"] = active_match_path
+            merged["InferredCanonicalRoleId"] = active_role.canonical_role_id
         if debug:
             merged.attrs["cohort_filter_diagnostics"] = getattr(
                 comparison_cohort, "attrs", {}
@@ -267,10 +396,9 @@ class AccessRecommendationEngine:
         merged = self._apply_reference_governance_metadata(merged)
 
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
-        if role_resolution.confidence_ceiling < 1.0:
-            merged["FinalScore"] = merged["FinalScore"].clip(
-                upper=float(role_resolution.confidence_ceiling)
-            )
+        score_ceiling = active_ceiling if bridge_confirmation is not None else role_resolution.confidence_ceiling
+        if score_ceiling < 1.0:
+            merged["FinalScore"] = merged["FinalScore"].clip(upper=float(score_ceiling))
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
         merged["Reason"] = self._build_reason_series(merged)
 
