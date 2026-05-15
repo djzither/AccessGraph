@@ -389,6 +389,17 @@ def _normalize_role_text(value: object) -> str:
     return " ".join(text.split())
 
 
+# Title-only peer-cohort aliases (deterministic; mirrors reference ROLE_ALIASES intent).
+PEER_TITLE_ALIASES: dict[str, frozenset[str]] = {
+    "computing specialist": frozenset({"computing specialist", "computer specialist"}),
+    "computer specialist": frozenset({"computing specialist", "computer specialist"}),
+}
+
+
+def _peer_title_clean_variants(title_clean: str) -> frozenset[str]:
+    return PEER_TITLE_ALIASES.get(title_clean, frozenset({title_clean}))
+
+
 def _median_group_count(users_df: pd.DataFrame) -> float:
     if users_df.empty:
         return 0.0
@@ -446,7 +457,6 @@ def build_peer_pool_from_anchor(
 ) -> PeerPoolBuildResult:
     target_row = target_user_row if target_user_row is not None else anchor_user_row
     users = users_df.copy()
-    cohort_median = _median_group_count(users)
 
     anchor_title = str(_row_value(anchor_user_row, "Title", ""))
     anchor_department = str(_row_value(anchor_user_row, "Department", ""))
@@ -459,20 +469,6 @@ def build_peer_pool_from_anchor(
     target_workforce = infer_workforce_type(target_row)
     anchor_workforce = infer_workforce_type(anchor_user_row)
     anchor_manager_netid = _manager_netid_for_row(anchor_user_row)
-    anchor_supervisor = is_supervisor_like(
-        anchor_user_row,
-        users_df=users,
-        target_workforce_type=target_workforce,
-        title_keywords=title_keywords,
-        cohort_median_group_count=cohort_median,
-    )
-    anchor_mismatch = (
-        target_workforce == WORKFORCE_STUDENT
-        and (
-            anchor_workforce == WORKFORCE_FULL_TIME
-            or anchor_supervisor
-        )
-    )
 
     users["TitleClean"] = users["Title"].apply(_normalize_role_text)
     users["DepartmentClean"] = users["Department"].apply(_normalize_role_text)
@@ -491,19 +487,37 @@ def build_peer_pool_from_anchor(
 
     _filter_stage("00_full_users_with_clean_columns", users)
 
-    candidates = users[users["DepartmentClean"] == anchor_department_clean].copy()
-    if candidates.empty:
-        candidates = users.copy()
-    _filter_stage("01_after_department_scope", candidates)
+    department_candidates = users[users["DepartmentClean"] == anchor_department_clean].copy()
+    if department_candidates.empty:
+        department_candidates = users.copy()
+    _filter_stage("01_after_department_scope", department_candidates)
 
-    same_type = candidates[
-        candidates.apply(lambda row: infer_workforce_type(row) == target_workforce, axis=1)
+    cohort_median = median_permission_count(department_candidates)
+
+    anchor_supervisor = is_supervisor_like(
+        anchor_user_row,
+        users_df=users,
+        target_workforce_type=target_workforce,
+        title_keywords=title_keywords,
+        cohort_median_group_count=cohort_median,
+    )
+    anchor_mismatch = (
+        target_workforce == WORKFORCE_STUDENT
+        and (
+            anchor_workforce == WORKFORCE_FULL_TIME
+            or anchor_supervisor
+        )
+    )
+
+    same_type = department_candidates[
+        department_candidates.apply(lambda row: infer_workforce_type(row) == target_workforce, axis=1)
     ].copy()
     if same_type.empty:
-        same_type = candidates
+        same_type = department_candidates
     _filter_stage("02_after_workforce_alignment", same_type)
 
-    title_scoped = same_type[same_type["TitleClean"] == anchor_title_clean]
+    title_variants = _peer_title_clean_variants(anchor_title_clean)
+    title_scoped = same_type[same_type["TitleClean"].isin(title_variants)]
     if not title_scoped.empty:
         candidates = title_scoped
     else:

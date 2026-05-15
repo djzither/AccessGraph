@@ -3,6 +3,7 @@ import pytest
 
 from DataLayer.peer_cohort import (
     _owns_sensitive_groups,
+    _peer_title_clean_variants,
     build_peer_pool_from_anchor,
     build_target_user_row,
     contamination_stats_for_group,
@@ -11,6 +12,7 @@ from DataLayer.peer_cohort import (
     is_manager_of_others,
     is_supervisor_like,
     is_valid_peer_relationship,
+    median_permission_count,
     normalize_groups,
     parse_manager_netid,
     peer_cohort_user_snapshot,
@@ -97,6 +99,200 @@ def test_is_supervisor_like_still_true_for_manager_with_numpy_baseline_groups():
     )
     row = users.iloc[0]
     assert is_supervisor_like(row, users_df=users, cohort_median_group_count=5.0) is True
+
+
+def test_is_supervisor_like_decision_notes_when_is_supervisor_truthy():
+    users = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "u1",
+                "Title": "Analyst",
+                "EmployeeType": "Full Time",
+                "GroupsList": ["DCE-DomainUsers"],
+                "IsSupervisor": True,
+            }
+        ]
+    )
+    row = users.iloc[0]
+    notes: list[str] = []
+    assert is_supervisor_like(row, users_df=users, decision_notes=notes) is True
+    assert "matched:IsSupervisor_column_truthy" in notes
+
+
+def _synthetic_permission_groups(count: int) -> list[str]:
+    return [f"PERM{i:03d}" for i in range(count)]
+
+
+def test_peer_title_aliases_computer_and_computing_specialist():
+    variants = _peer_title_clean_variants("computing specialist")
+    assert "computer specialist" in variants
+    assert "computing specialist" in variants
+
+
+def test_computing_and_computer_specialist_share_peer_cohort():
+    dept = "CE IT Help Desk"
+    group_count = 20
+    groups = _synthetic_permission_groups(group_count)
+    rows = [
+        {
+            "SamAccountName": "anchor",
+            "Title": "Computing Specialist",
+            "Department": dept,
+            "EmployeeType": "Full Time",
+            "GroupsList": groups,
+            "Manager": "",
+            "IsSupervisor": False,
+        },
+        {
+            "SamAccountName": "peer.comp",
+            "Title": "Computer Specialist",
+            "Department": dept,
+            "EmployeeType": "Full Time",
+            "GroupsList": groups,
+            "Manager": "",
+            "IsSupervisor": False,
+        },
+        {
+            "SamAccountName": "peer.cs",
+            "Title": "Computing Specialist",
+            "Department": dept,
+            "EmployeeType": "Full Time",
+            "GroupsList": groups,
+            "Manager": "",
+            "IsSupervisor": False,
+        },
+    ]
+    users_df = pd.DataFrame(rows)
+    anchor = users_df.iloc[0]
+    target = build_target_user_row(
+        title="Computing Specialist",
+        department=dept,
+        employee_type="Full Time",
+    )
+    result = build_peer_pool_from_anchor(users_df, anchor, target)
+    peer_ids = set(result.peer_pool["SamAccountName"].astype(str))
+    assert "peer.comp" in peer_ids
+    assert "peer.cs" in peer_ids
+
+
+def test_ce_it_help_desk_high_group_count_not_supervisor_outlier_with_dept_median():
+    dept = "CE IT Help Desk"
+    groups = _synthetic_permission_groups(22)
+    dept_users = pd.DataFrame(
+        [
+            {
+                "SamAccountName": f"it{i}",
+                "Title": "Computing Specialist",
+                "Department": dept,
+                "EmployeeType": "Full Time",
+                "GroupsList": groups,
+                "IsSupervisor": False,
+            }
+            for i in range(5)
+        ]
+    )
+    org_padding = pd.DataFrame(
+        [
+            {
+                "SamAccountName": f"pad{i}",
+                "Title": "Clerk",
+                "Department": f"Dept{i % 10}",
+                "EmployeeType": "Full Time",
+                "GroupsList": ["Email"],
+                "IsSupervisor": False,
+            }
+            for i in range(40)
+        ]
+    )
+    users_df = pd.concat([dept_users, org_padding], ignore_index=True)
+    row = dept_users.iloc[0]
+    dept_median = median_permission_count(dept_users)
+    org_median = median_permission_count(users_df)
+    assert org_median == 1.0
+    assert dept_median >= 20.0
+    assert (
+        is_supervisor_like(
+            row,
+            users_df=users_df,
+            cohort_median_group_count=dept_median,
+        )
+        is False
+    )
+    assert (
+        is_supervisor_like(
+            row,
+            users_df=users_df,
+            cohort_median_group_count=org_median,
+        )
+        is True
+    )
+
+
+def test_ce_it_help_desk_computing_specialist_cohort_not_collapsed_by_global_median():
+    """Regression: org-wide median=1 must not shrink IT specialist peer pool to ~2."""
+    dept = "CE IT Help Desk"
+    group_count = 20
+    groups = _synthetic_permission_groups(group_count)
+
+    specialist_rows = []
+    specialist_rows.append(
+        {
+            "SamAccountName": "anchor",
+            "Title": "Computing Specialist",
+            "Department": dept,
+            "EmployeeType": "Full Time",
+            "GroupsList": groups,
+            "Manager": "",
+            "IsSupervisor": False,
+        }
+    )
+    specialist_rows.append(
+        {
+            "SamAccountName": "peer.comp",
+            "Title": "Computer Specialist",
+            "Department": dept,
+            "EmployeeType": "Full Time",
+            "GroupsList": groups,
+            "Manager": "",
+            "IsSupervisor": False,
+        }
+    )
+    for i in range(2, 8):
+        specialist_rows.append(
+            {
+                "SamAccountName": f"peer{i}",
+                "Title": "Computing Specialist" if i % 2 == 0 else "Computer Specialist",
+                "Department": dept,
+                "EmployeeType": "Full Time",
+                "GroupsList": groups,
+                "Manager": "",
+                "IsSupervisor": False,
+            }
+        )
+    org_padding = [
+        {
+            "SamAccountName": f"pad{i}",
+            "Title": "Clerk",
+            "Department": f"Other {i}",
+            "EmployeeType": "Full Time",
+            "GroupsList": ["Email"],
+            "IsSupervisor": False,
+        }
+        for i in range(50)
+    ]
+    users_df = pd.DataFrame(specialist_rows + org_padding)
+    anchor = users_df.iloc[0]
+    target = build_target_user_row(
+        title="Computing Specialist",
+        department=dept,
+        employee_type="Full Time",
+    )
+    result = build_peer_pool_from_anchor(users_df, anchor, target)
+    assert result.peer_pool_size >= 6
+    peer_ids = set(result.peer_pool["SamAccountName"].astype(str))
+    assert len(peer_ids) >= 6
+    assert "peer.comp" in peer_ids
+    assert all(f"peer{i}" in peer_ids for i in range(2, 8))
 
 
 def test_computing_specialist_peer_pool_not_collapsed_by_numpy_groupslist():
