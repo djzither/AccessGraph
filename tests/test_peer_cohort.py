@@ -3,7 +3,6 @@ import pytest
 
 from DataLayer.peer_cohort import (
     _owns_sensitive_groups,
-    _peer_title_clean_variants,
     build_peer_pool_from_anchor,
     build_target_user_row,
     contamination_stats_for_group,
@@ -121,12 +120,6 @@ def test_is_supervisor_like_decision_notes_when_is_supervisor_truthy():
 
 def _synthetic_permission_groups(count: int) -> list[str]:
     return [f"PERM{i:03d}" for i in range(count)]
-
-
-def test_peer_title_aliases_computer_and_computing_specialist():
-    variants = _peer_title_clean_variants("computing specialist")
-    assert "computer specialist" in variants
-    assert "computing specialist" in variants
 
 
 def test_computing_and_computer_specialist_share_peer_cohort():

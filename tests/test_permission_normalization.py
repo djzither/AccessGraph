@@ -2,6 +2,8 @@ import numpy as np
 import pandas as pd
 
 from DataLayer.permission_normalization import (
+    canonical_permission_id,
+    canonicalize_permission,
     normalize_groups_input,
     normalize_single_permission,
 )
@@ -27,3 +29,20 @@ def test_normalize_groups_input_numpy_array():
 
 def test_normalize_groups_input_pandas_na_scalar():
     assert normalize_groups_input(pd.NA) == []
+
+
+def test_canonical_permission_id_collapses_cmp_allusers_variants():
+    assert canonical_permission_id("CMP.AllUsers") == canonical_permission_id("DCE.CMP.Allusers")
+
+
+def test_canonical_permission_id_collapses_domain_admins_variants():
+    assert canonical_permission_id("CMP.Domain Admins") == canonical_permission_id(
+        "DCE.CMP.DomainAdmins"
+    )
+
+
+def test_canonicalize_permission_preserves_raw_and_source():
+    result = canonicalize_permission("DCE.CMP.Allusers", source="ad")
+    assert result.raw_permission_name == "DCE.CMP.Allusers"
+    assert result.canonical_permission_id == canonical_permission_id("CMP.AllUsers")
+    assert result.source == "ad"

@@ -8,7 +8,9 @@ are handled consistently.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable
+from dataclasses import dataclass
 
 import pandas as pd
 
@@ -79,3 +81,38 @@ def normalize_groups_input(value: object) -> list[str]:
         pass
 
     return _normalize_delimited_string(str(value))
+
+
+_PERMISSION_PREFIXES = ("m.", "i.", "dce.", "dce-", "dce ")
+
+
+def canonical_permission_id(value: object) -> str:
+    """
+    Stable comparison key for AD groups and reference access names.
+
+    Collapses variant prefixes and punctuation so e.g. CMP.AllUsers and
+    DCE.CMP.Allusers compare equal.
+    """
+    base = normalize_single_permission(value)
+    text = str(base).lower().strip() if base else ""
+    for prefix in _PERMISSION_PREFIXES:
+        if text.startswith(prefix):
+            text = text[len(prefix) :]
+            break
+    return re.sub(r"[\s._-]+", "", text)
+
+
+@dataclass(frozen=True)
+class PermissionCanonical:
+    raw_permission_name: str
+    canonical_permission_id: str
+    source: str = "unknown"
+
+
+def canonicalize_permission(value: object, *, source: str = "unknown") -> PermissionCanonical:
+    raw = normalize_single_permission(value) or ""
+    return PermissionCanonical(
+        raw_permission_name=raw,
+        canonical_permission_id=canonical_permission_id(value),
+        source=source,
+    )

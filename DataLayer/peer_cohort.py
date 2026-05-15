@@ -10,6 +10,13 @@ import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list
 from DataLayer.permission_normalization import normalize_groups_input
+from DataLayer.canonical_role import (
+    MATCH_PATH_EXACT_FALLBACK,
+    MATCH_PATH_REGISTRY,
+    RoleCanonicalResult,
+    canonical_role_id,
+    normalize_role_text,
+)
 from DataLayer.workforce_type import FULL_TIME, STUDENT, UNKNOWN, canonical_from_ui_label
 
 logger = logging.getLogger(__name__)
@@ -383,21 +390,20 @@ class PeerPoolBuildResult:
 
 
 def _normalize_role_text(value: object) -> str:
-    text = _normalize_text(value)
-    for old, new in [("&", " and "), (",", " "), ("/", " "), ("-", " ")]:
-        text = text.replace(old, new)
-    return " ".join(text.split())
+    return normalize_role_text(value)
 
 
-# Title-only peer-cohort aliases (deterministic; mirrors reference ROLE_ALIASES intent).
-PEER_TITLE_ALIASES: dict[str, frozenset[str]] = {
-    "computing specialist": frozenset({"computing specialist", "computer specialist"}),
-    "computer specialist": frozenset({"computing specialist", "computer specialist"}),
-}
-
-
-def _peer_title_clean_variants(title_clean: str) -> frozenset[str]:
-    return PEER_TITLE_ALIASES.get(title_clean, frozenset({title_clean}))
+def _role_for_row(
+    row: Any,
+    *,
+    workforce_canonical: str,
+) -> RoleCanonicalResult:
+    return canonical_role_id(
+        title=_row_value(row, "Title", ""),
+        department=_row_value(row, "Department", ""),
+        employee_type=_row_value(row, "EmployeeType", None),
+        workforce_canonical=workforce_canonical,
+    )
 
 
 def _median_group_count(users_df: pd.DataFrame) -> float:
@@ -474,6 +480,11 @@ def build_peer_pool_from_anchor(
     users["DepartmentClean"] = users["Department"].apply(_normalize_role_text)
     anchor_title_clean = _normalize_role_text(anchor_title)
     anchor_department_clean = _normalize_role_text(anchor_department)
+    target_workforce_canonical = _workforce_to_canonical(target_workforce)
+    anchor_role = _role_for_row(
+        anchor_user_row,
+        workforce_canonical=target_workforce_canonical,
+    )
 
     filter_stages: list[dict[str, Any]] = []
 
@@ -516,10 +527,33 @@ def build_peer_pool_from_anchor(
         same_type = department_candidates
     _filter_stage("02_after_workforce_alignment", same_type)
 
-    title_variants = _peer_title_clean_variants(anchor_title_clean)
-    title_scoped = same_type[same_type["TitleClean"].isin(title_variants)]
-    if not title_scoped.empty:
-        candidates = title_scoped
+    same_type = same_type.copy()
+
+    def _assign_role_columns(frame: pd.DataFrame) -> pd.DataFrame:
+        role_ids: list[str] = []
+        match_paths: list[str] = []
+        for _, row in frame.iterrows():
+            resolved = _role_for_row(
+                row,
+                workforce_canonical=target_workforce_canonical,
+            )
+            role_ids.append(resolved.canonical_role_id)
+            match_paths.append(resolved.match_path)
+        frame = frame.copy()
+        frame["CanonicalRoleId"] = role_ids
+        frame["RoleMatchPath"] = match_paths
+        return frame
+
+    same_type = _assign_role_columns(same_type)
+
+    role_scoped = same_type[
+        same_type["CanonicalRoleId"] == anchor_role.canonical_role_id
+    ]
+    if not role_scoped.empty:
+        candidates = role_scoped
+    elif anchor_role.match_path == MATCH_PATH_EXACT_FALLBACK:
+        title_scoped = same_type[same_type["TitleClean"] == anchor_title_clean]
+        candidates = title_scoped if not title_scoped.empty else same_type
     else:
         candidates = same_type
     _filter_stage("03_pre_pairwise_selection", candidates)
@@ -735,6 +769,9 @@ def build_peer_pool_from_anchor(
             "anchor_samaccountname": anchor_netid,
             "anchor_department_clean": anchor_department_clean,
             "anchor_title_clean": anchor_title_clean,
+            "anchor_canonical_role_id": anchor_role.canonical_role_id,
+            "anchor_role_match_path": anchor_role.match_path,
+            "anchor_raw_title": anchor_role.raw_title,
             "target_workforce_type": target_workforce,
             "anchor_mismatch": anchor_mismatch,
             "scoped_candidate_count": int(len(candidates)),

@@ -6,7 +6,10 @@ from dataclasses import dataclass
 import pandas as pd
 
 from DataLayer.access_exclusions import filter_group_list
-from DataLayer.permission_normalization import normalize_single_permission
+from DataLayer.permission_normalization import (
+    canonical_permission_id,
+    normalize_single_permission,
+)
 
 
 @dataclass(frozen=True)
@@ -22,13 +25,23 @@ def _normalize_group(value: object) -> str:
     return normalize_single_permission(value) or ""
 
 
+def _canonical_group(value: object) -> str:
+    if not _normalize_group(value):
+        return ""
+    return canonical_permission_id(value)
+
+
 def _user_groups_map(users_df: pd.DataFrame) -> dict[str, set[str]]:
     user_map: dict[str, set[str]] = {}
     for _, row in users_df.iterrows():
         netid = str(row.get("SamAccountName", "")).strip()
         if not netid:
             continue
-        groups = {_normalize_group(g) for g in filter_group_list(row.get("GroupsList")) if _normalize_group(g)}
+        groups = {
+            _canonical_group(g)
+            for g in filter_group_list(row.get("GroupsList"))
+            if _canonical_group(g)
+        }
         user_map[netid] = groups
     return user_map
 
@@ -62,7 +75,7 @@ def analyze_permission_subgroup(
     config: SubgroupDetectionConfig | None = None,
 ) -> dict[str, object]:
     cfg = config or SubgroupDetectionConfig()
-    permission = _normalize_group(permission)
+    permission = _canonical_group(permission)
     if comparison_cohort.empty:
         return {
             "permission": permission,

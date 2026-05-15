@@ -12,7 +12,10 @@ from DataLayer.access_exclusions import (
     filter_reference_df,
     filter_user_groups_df,
 )
-from DataLayer.permission_normalization import normalize_single_permission
+from DataLayer.permission_normalization import (
+    canonical_permission_id,
+    normalize_single_permission,
+)
 from DataLayer.workforce_type import (
     canonical_from_ui_label,
     reference_match_value,
@@ -1719,16 +1722,7 @@ class AccessRecommendationEngine:
 
     @classmethod
     def _normalize_group_name(cls, value) -> str:
-        base = normalize_single_permission(value)
-        text = str(base).lower().strip() if base else ""
-
-        for prefix in ("m.", "i.", "dce.", "dce-", "dce "):
-            if text.startswith(prefix):
-                text = text[len(prefix):]
-                break
-
-        text = re.sub(r"[\s._-]+", "", text)
-        return text
+        return canonical_permission_id(value)
 
     @classmethod
     def _is_fsy_role(cls, title: str, department: str) -> bool:
