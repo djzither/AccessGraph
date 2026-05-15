@@ -70,6 +70,28 @@ class _RoleClusterSpec:
     title_stems: frozenset[str] = frozenset()
 
 
+# Reference-sheet (title, department) alternates for cluster department expansion.
+REFERENCE_ROLE_DEPARTMENT_ALIASES: dict[tuple[str, str], frozenset[tuple[str, str]]] = {
+    (
+        "academic outreach and sales rep",
+        "ce academic outreach and sales",
+    ): frozenset(
+        {
+            ("academic outreach sales rep", "marketing and customer support"),
+        }
+    ),
+    (
+        "computing specialist",
+        "ce it help desk",
+    ): frozenset(
+        {
+            ("computing specialist", "information technology"),
+        }
+    ),
+}
+
+_REFERENCE_STEM_NUMBERED_SUFFIXES = tuple(str(n) for n in range(1, 10))
+
 # Operational clusters: extend here instead of ad-hoc title aliases.
 ROLE_CLUSTERS: dict[str, _RoleClusterSpec] = {
     "role:ce_it_helpdesk_student_support": _RoleClusterSpec(
@@ -108,6 +130,49 @@ def _register_clusters() -> None:
 
 
 _register_clusters()
+
+
+def _cluster_reference_departments(spec: _RoleClusterSpec) -> set[str]:
+    departments = {spec.department_clean}
+    for (_title_key, dept_key), alts in REFERENCE_ROLE_DEPARTMENT_ALIASES.items():
+        if dept_key == spec.department_clean:
+            departments.update(alt[1] for alt in alts)
+        for _alt_title, alt_dept in alts:
+            if alt_dept == spec.department_clean:
+                departments.add(dept_key)
+    return departments
+
+
+def _cluster_reference_titles(spec: _RoleClusterSpec) -> set[str]:
+    titles = set(spec.titles)
+    for stem in spec.title_stems:
+        titles.add(stem)
+        for suffix in _REFERENCE_STEM_NUMBERED_SUFFIXES:
+            titles.add(f"{stem} {suffix}")
+    return titles
+
+
+def cluster_reference_candidates(role_id: str) -> set[tuple[str, str]]:
+    """
+    Reference lookup (title_clean, department_clean) pairs for a canonical role cluster.
+    """
+    spec = ROLE_CLUSTERS.get(role_id)
+    if spec is None:
+        return set()
+
+    departments = _cluster_reference_departments(spec)
+    titles = _cluster_reference_titles(spec)
+    candidates: set[tuple[str, str]] = set()
+    for title in titles:
+        for dept in departments:
+            candidates.add((title, dept))
+
+    for title in titles:
+        alias_key = (title, spec.department_clean)
+        for alt_title, alt_dept in REFERENCE_ROLE_DEPARTMENT_ALIASES.get(alias_key, ()):
+            candidates.add((alt_title, alt_dept))
+
+    return candidates
 
 
 def canonical_role_id(

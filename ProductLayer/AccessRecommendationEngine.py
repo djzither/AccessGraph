@@ -16,6 +16,7 @@ from DataLayer.permission_normalization import (
     canonical_permission_id,
     normalize_single_permission,
 )
+from DataLayer.canonical_role import ROLE_CLUSTERS, cluster_reference_candidates
 from DataLayer.workforce_type import (
     canonical_from_ui_label,
     reference_match_value,
@@ -156,6 +157,7 @@ class AccessRecommendationEngine:
             users_df=users_df,
             copy_from_netid=copy_from_netid,
             reference_debug=debug,
+            canonical_role_id=target_role.canonical_role_id,
         )
         reference_diagnostics = dict(reference_recs.attrs.get("reference_diagnostics", {}))
         reference_permission_count = 0
@@ -426,6 +428,7 @@ class AccessRecommendationEngine:
         copy_from_netid: str | None,
         *,
         reference_debug: bool = False,
+        canonical_role_id: str | None = None,
     ) -> pd.DataFrame:
 
         ref = reference_df.copy()
@@ -490,7 +493,11 @@ class AccessRecommendationEngine:
         else:
             ref["ReferenceEmployeeNameClean"] = ""
 
-        role_candidates = self._role_candidates(title=title, department=department)
+        role_candidates, reference_candidate_source = self._role_candidates(
+            title=title,
+            department=department,
+            canonical_role_id=canonical_role_id,
+        )
         employee_type_clean = (
             reference_match_value(canonical_from_ui_label(employee_type))
             if employee_type is not None and str(employee_type).strip()
@@ -509,6 +516,7 @@ class AccessRecommendationEngine:
             "fallback_candidate_departments": [],
             "fallback_rows_after_department_guard": 0,
             "fallback_empty_due_to_department_mismatch": False,
+            "reference_candidate_source": reference_candidate_source,
         }
 
         match_stages: dict[str, object] | None = {} if reference_debug else None
@@ -1938,13 +1946,37 @@ class AccessRecommendationEngine:
         return " ".join(text.split())
 
     @classmethod
-    def _role_candidates(cls, title: str, department: str) -> set[tuple[str, str]]:
+    def _role_candidates(
+        cls,
+        title: str,
+        department: str,
+        *,
+        canonical_role_id: str | None = None,
+    ) -> tuple[set[tuple[str, str]], str]:
         base_key = (
             cls._normalize_role_text(title),
             cls._normalize_role_text(department),
         )
+        candidates = {base_key}
+        source = "exact"
 
-        return {base_key, *cls.ROLE_ALIASES.get(base_key, set())}
+        role_id = (canonical_role_id or "").strip()
+        if role_id in ROLE_CLUSTERS:
+            cluster_pairs = cluster_reference_candidates(role_id)
+            if cluster_pairs:
+                candidates |= cluster_pairs
+                source = "cluster_expanded"
+
+        legacy = cls.ROLE_ALIASES.get(base_key, set())
+        if legacy:
+            candidates |= legacy
+            if source == "exact":
+                source = "legacy_alias"
+
+        if not candidates:
+            source = "none"
+
+        return candidates, source
 
     @classmethod
     def _normalize_group_name(cls, value) -> str:
