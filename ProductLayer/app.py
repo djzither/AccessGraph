@@ -532,14 +532,12 @@ def render_onboarding_tab(
         st.info(
             f"**{cohort_msg}** existing users match this title + department "
             "(when both are selected). "
-            "Choose **Job Title**, **Department**, and **Employee Type**, then click "
+            "Choose **Department** and **Employee Type** (job title optional), then click "
             "**Generate Recommendations**."
         )
         return
 
     missing_required: list[str] = []
-    if not title:
-        missing_required.append("Job Title")
     if not department:
         missing_required.append("Department")
     if not employee_type:
@@ -606,6 +604,14 @@ def render_onboarding_tab(
             peer_bits.append(f"Outliers excluded: `{outliers_excluded}`")
         if peer_bits:
             st.caption(" · ".join(peer_bits))
+
+    role_inf = getattr(recs, "attrs", {}).get("role_inference") or {}
+    if role_inf:
+        with st.expander("Role inference (debug)", expanded=bool(role_inf.get("warning"))):
+            st.json(role_inf)
+            warn = str(role_inf.get("warning") or "").strip()
+            if warn:
+                st.warning(warn)
 
     # ── Results table ─────────────────────────────────────────────────────────
     display_cols = [

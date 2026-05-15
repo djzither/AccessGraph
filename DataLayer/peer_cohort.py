@@ -453,6 +453,10 @@ def explain_peer_cohort_build(
     ).cohort_filter_diagnostics
 
 
+def _is_cohort_wide_role_id(role_id: str) -> bool:
+    return str(role_id).startswith("cohort:")
+
+
 def build_peer_pool_from_anchor(
     users_df: pd.DataFrame,
     anchor_user_row: Any,
@@ -460,6 +464,7 @@ def build_peer_pool_from_anchor(
     *,
     title_keywords: tuple[str, ...] = DEFAULT_SUPERVISOR_TITLE_KEYWORDS,
     cohort_diagnostics: bool = False,
+    target_role: RoleCanonicalResult | None = None,
 ) -> PeerPoolBuildResult:
     target_row = target_user_row if target_user_row is not None else anchor_user_row
     users = users_df.copy()
@@ -481,10 +486,13 @@ def build_peer_pool_from_anchor(
     anchor_title_clean = _normalize_role_text(anchor_title)
     anchor_department_clean = _normalize_role_text(anchor_department)
     target_workforce_canonical = _workforce_to_canonical(target_workforce)
-    anchor_role = _role_for_row(
-        anchor_user_row,
-        workforce_canonical=target_workforce_canonical,
-    )
+    if target_role is not None:
+        anchor_role = target_role
+    else:
+        anchor_role = _role_for_row(
+            anchor_user_row,
+            workforce_canonical=target_workforce_canonical,
+        )
 
     filter_stages: list[dict[str, Any]] = []
 
@@ -546,16 +554,19 @@ def build_peer_pool_from_anchor(
 
     same_type = _assign_role_columns(same_type)
 
-    role_scoped = same_type[
-        same_type["CanonicalRoleId"] == anchor_role.canonical_role_id
-    ]
-    if not role_scoped.empty:
-        candidates = role_scoped
-    elif anchor_role.match_path == MATCH_PATH_EXACT_FALLBACK:
-        title_scoped = same_type[same_type["TitleClean"] == anchor_title_clean]
-        candidates = title_scoped if not title_scoped.empty else same_type
-    else:
+    if _is_cohort_wide_role_id(anchor_role.canonical_role_id):
         candidates = same_type
+    else:
+        role_scoped = same_type[
+            same_type["CanonicalRoleId"] == anchor_role.canonical_role_id
+        ]
+        if not role_scoped.empty:
+            candidates = role_scoped
+        elif anchor_role.match_path == MATCH_PATH_EXACT_FALLBACK:
+            title_scoped = same_type[same_type["TitleClean"] == anchor_title_clean]
+            candidates = title_scoped if not title_scoped.empty else same_type
+        else:
+            candidates = same_type
     _filter_stage("03_pre_pairwise_selection", candidates)
 
     removals: list[dict[str, Any]] = []
@@ -772,6 +783,7 @@ def build_peer_pool_from_anchor(
             "anchor_canonical_role_id": anchor_role.canonical_role_id,
             "anchor_role_match_path": anchor_role.match_path,
             "anchor_raw_title": anchor_role.raw_title,
+            "target_canonical_role_id": anchor_role.canonical_role_id,
             "target_workforce_type": target_workforce,
             "anchor_mismatch": anchor_mismatch,
             "scoped_candidate_count": int(len(candidates)),

@@ -28,6 +28,11 @@ from DataLayer.peer_cohort import (
     is_supervisor_like,
     median_permission_count,
 )
+from DataLayer.role_inference import (
+    INFERRED_MATCH_PATHS,
+    resolve_onboarding_role,
+    supervisor_cell_matches_target,
+)
 from DataLayer.subgroup_detection import analyze_recommendation_subgroups
 from DeterministicLayer.access_pattern_labels import apply_access_pattern_columns
 from DeterministicLayer.permission_filter import PermissionFilter
@@ -108,6 +113,15 @@ class AccessRecommendationEngine:
 
         debug = bool(cohort_diagnostics or recommendation_debug)
 
+        role_resolution = resolve_onboarding_role(
+            title=title,
+            department=department,
+            employee_type=employee_type,
+            supervisor=supervisor,
+            copy_from_netid=copy_from_netid,
+            users_df=users_df,
+        )
+
         reference_recs = self._get_reference_recommendations(
             reference_df=reference_df,
             title=title,
@@ -137,6 +151,7 @@ class AccessRecommendationEngine:
             target_user_row=target_user_row,
             peer_pool_metadata=peer_pool_metadata,
             cohort_diagnostics=debug,
+            target_role=role_resolution.role,
         )
 
         ad_recs = self._get_ad_recommendations(
@@ -163,6 +178,19 @@ class AccessRecommendationEngine:
             copy_from_recs=copy_from_recs,
         )
         merged.attrs["reference_diagnostics"] = reference_diagnostics
+        merged.attrs["role_inference"] = {
+            "canonical_role_id": role_resolution.role.canonical_role_id,
+            "role_match_path": role_resolution.role.match_path,
+            "confidence_ceiling": role_resolution.confidence_ceiling,
+            "warning": role_resolution.warning,
+            "ambiguous": role_resolution.ambiguous,
+            "candidate_roles": list(role_resolution.candidate_roles),
+            "inference_debug": dict(role_resolution.inference_debug),
+        }
+        if role_resolution.confidence_ceiling < 1.0:
+            merged["RoleInferenceWarning"] = role_resolution.warning
+            merged["RoleMatchPath"] = role_resolution.role.match_path
+            merged["InferredCanonicalRoleId"] = role_resolution.role.canonical_role_id
         if debug:
             merged.attrs["cohort_filter_diagnostics"] = getattr(
                 comparison_cohort, "attrs", {}
@@ -239,6 +267,10 @@ class AccessRecommendationEngine:
         merged = self._apply_reference_governance_metadata(merged)
 
         merged["FinalScore"] = merged.apply(self._score_row, axis=1)
+        if role_resolution.confidence_ceiling < 1.0:
+            merged["FinalScore"] = merged["FinalScore"].clip(
+                upper=float(role_resolution.confidence_ceiling)
+            )
         merged["FinalDecision"] = merged.apply(self._final_decision, axis=1)
         merged["Reason"] = self._build_reason_series(merged)
 
@@ -464,13 +496,12 @@ class AccessRecommendationEngine:
                     else:
                         matched = ref.iloc[0:0].copy()
 
-        if employee_type_clean == "full time" and supervisor is not None:
-            supervisor_clean = str(supervisor).lower().strip()
-
+        if supervisor is not None and str(supervisor).strip():
             supervisor_matches = matched[
-                matched["SupervisorClean"] == supervisor_clean
+                matched["Supervisor"].apply(
+                    lambda cell: supervisor_cell_matches_target(cell, supervisor)
+                )
             ]
-
             if not supervisor_matches.empty:
                 matched = supervisor_matches
         if reference_debug:
@@ -1498,6 +1529,55 @@ class AccessRecommendationEngine:
                 df[key] = value
         return df
 
+    def _cohort_for_resolved_role(
+        self,
+        *,
+        users: pd.DataFrame,
+        department_clean: str,
+        target_canonical: str,
+        target_role: object,
+        reference_group_names: set[str],
+        title_clean: str,
+    ) -> pd.DataFrame | None:
+        from DataLayer.canonical_role import canonical_role_id as _canonical_role_id
+        from DataLayer.peer_cohort import _is_cohort_wide_role_id
+
+        same_department = users[users["DepartmentClean"] == department_clean].copy()
+        if same_department.empty:
+            return None
+        dept_workforce = self._cohort_with_workforce(same_department, target_canonical)
+        if dept_workforce.empty:
+            return None
+
+        role_id = str(getattr(target_role, "canonical_role_id", ""))
+        if _is_cohort_wide_role_id(role_id):
+            refined = self._refine_by_reference_overlap(
+                dept_workforce, reference_group_names, title_clean
+            )
+            refined.attrs = getattr(dept_workforce, "attrs", {}).copy()
+            return refined
+
+        wf = str(getattr(target_role, "workforce_canonical", target_canonical))
+        role_ids: list[str] = []
+        for _, row in dept_workforce.iterrows():
+            resolved = _canonical_role_id(
+                title=row.get("Title", ""),
+                department=row.get("Department", ""),
+                employee_type=row.get("EmployeeType"),
+                workforce_canonical=wf,
+            )
+            role_ids.append(resolved.canonical_role_id)
+        scoped = dept_workforce.copy()
+        scoped["CanonicalRoleId"] = role_ids
+        role_cohort = scoped[scoped["CanonicalRoleId"] == role_id].copy()
+        if len(role_cohort) < 2:
+            return None
+        refined = self._refine_by_reference_overlap(
+            role_cohort, reference_group_names, title_clean
+        )
+        refined.attrs = getattr(role_cohort, "attrs", {}).copy()
+        return refined
+
     @staticmethod
     def _stamp_cohort_diagnostics(
         cohort: pd.DataFrame,
@@ -1525,6 +1605,7 @@ class AccessRecommendationEngine:
         target_user_row: dict[str, object] | None = None,
         peer_pool_metadata: dict[str, object] | None = None,
         cohort_diagnostics: bool = False,
+        target_role: object | None = None,
     ) -> pd.DataFrame:
         """
         Build the best comparison cohort using a 4-level fallback strategy.
@@ -1565,6 +1646,7 @@ class AccessRecommendationEngine:
                         employee_type=employee_type,
                     ),
                     cohort_diagnostics=cohort_diagnostics,
+                    target_role=target_role,
                 )
                 if peer_pool_metadata is not None:
                     peer_pool_metadata.update(peer_result.as_metadata())
@@ -1589,6 +1671,22 @@ class AccessRecommendationEngine:
                             fallback_level=0,
                             used_for_scoring="anchor_peer_pool",
                         )
+
+        if target_role is not None and getattr(target_role, "match_path", "") in INFERRED_MATCH_PATHS:
+            inferred_cohort = self._cohort_for_resolved_role(
+                users=users,
+                department_clean=department_clean,
+                target_canonical=target_canonical,
+                target_role=target_role,
+                reference_group_names=reference_group_names,
+                title_clean=title_clean,
+            )
+            if inferred_cohort is not None and not inferred_cohort.empty:
+                return self._stamp_cohort_diagnostics(
+                    inferred_cohort,
+                    fallback_level=0,
+                    used_for_scoring="inferred_role",
+                )
 
         # Level 1: exact title + department
         exact_cohort = users[
