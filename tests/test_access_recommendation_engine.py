@@ -923,3 +923,73 @@ def test_ad_support_counts_parse_semicolon_groupslist_for_copy_from_right():
     assert row["TotalUsersInRole"] == 4
     assert row["UserCountWithGroup"] == 2
     assert row["ADConfidence"] == pytest.approx(0.5, rel=1e-6)
+
+
+def _ce_it_student_reference_fixture() -> tuple[pd.DataFrame, pd.DataFrame]:
+    users_df = pd.DataFrame(
+        [
+            {
+                "SamAccountName": "u1",
+                "Title": "Computing Specialist",
+                "Department": "CE IT Help Desk",
+                "GroupsList": ["VPN", "Email"],
+            },
+        ]
+    )
+    reference_df = pd.DataFrame(
+        [
+            {
+                "EmployeeType": "Student",
+                "JobTitle": "Computing Specialist",
+                "Department": "Information Technology",
+                "Supervisor": None,
+                "AccessCategory": "AD Rights",
+                "AccessName": "VPN",
+                "SourceFile": "student_employee_access.xlsx",
+            },
+            {
+                "EmployeeType": "Student",
+                "JobTitle": "Computing Specialist",
+                "Department": "Information Technology",
+                "Supervisor": None,
+                "AccessCategory": "AD Rights",
+                "AccessName": "Email",
+                "SourceFile": "student_employee_access.xlsx",
+            },
+        ]
+    )
+    return users_df, reference_df
+
+
+@pytest.mark.parametrize(
+    "title",
+    [
+        "Computing Specialist",
+        "Computer Specialist",
+        "Student Worker 5",
+    ],
+)
+def test_ce_it_student_title_variants_share_reference_template(title):
+    users_df, reference_df = _ce_it_student_reference_fixture()
+    engine = AccessRecommendationEngine(min_confidence=0.4)
+    recs = engine.recommend_for_hire(
+        users_df=users_df,
+        reference_df=reference_df,
+        title=title,
+        department="CE IT Help Desk",
+        employee_type="Student",
+        supervisor=None,
+        copy_from_netid=None,
+        new_hire_netid=None,
+        recommendation_debug=True,
+    )
+    role_inference = recs.attrs.get("role_inference", {})
+    assert role_inference.get("canonical_role_id") == "role:ce_it_helpdesk_student_support"
+
+    diag = recs.attrs.get("reference_diagnostics", {})
+    assert diag.get("reference_match_path") != "no_reference_match"
+    assert diag.get("reference_candidate_source") == "cluster_expanded"
+
+    by_group = recs.set_index("GroupName")
+    assert bool(by_group.loc["VPN", "InReferenceSheet"]) is True
+    assert bool(by_group.loc["Email", "InReferenceSheet"]) is True
